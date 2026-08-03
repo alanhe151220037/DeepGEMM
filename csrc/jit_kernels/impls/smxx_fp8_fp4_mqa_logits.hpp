@@ -18,6 +18,7 @@ public:
         int stride_logits;
         int num_heads, head_dim;
         bool is_compressed_logits;
+        bool enable_filter_v2;
 
         int num_q_stages;
         int num_kv_stages;
@@ -27,6 +28,13 @@ public:
         int* cu_seq_len_k_start;
         int* cu_seq_len_k_end;
         void* logits;
+        void* filter_thresholds;
+        void* candidate_scores;
+        int* candidate_indices;
+        int* candidate_counts;
+        int* candidate_overflow;
+        int candidate_capacity;
+        int* q_block_starts;
 
         CUtensorMap tensor_map_q;
         CUtensorMap tensor_map_kv;
@@ -53,8 +61,7 @@ using namespace deep_gemm;
 
 static void __instantiate_kernel() {{
     auto ptr = reinterpret_cast<void*>(&sm{}_fp8_mqa_logits<
-        {}, {},
-        {},
+        {}, {}, {}, {},
         {}, {},
         {}, {},
         {},
@@ -64,7 +71,7 @@ static void __instantiate_kernel() {{
 }};
 )", arch, arch,
     args.num_heads, args.head_dim,
-    args.is_compressed_logits,
+    args.is_compressed_logits, args.enable_filter_v2,
     args.block_q, args.block_kv,
     args.num_q_stages, args.num_kv_stages,
     args.launch_args.grid_dim.first,
@@ -78,6 +85,10 @@ static void __instantiate_kernel() {{
             args.max_seqlen_k, args.stride_logits,
             args.cu_seq_len_k_start, args.cu_seq_len_k_end,
             args.logits,
+            args.filter_thresholds, args.candidate_scores,
+            args.candidate_indices, args.candidate_counts,
+            args.candidate_overflow, args.candidate_capacity,
+            args.q_block_starts,
             args.tensor_map_q, args.tensor_map_kv,
             args.tensor_map_kv_scales, args.tensor_map_weights
         ));
@@ -94,7 +105,8 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
                                 const int& seq_len, const int& seq_len_kv,
                                 const int& max_seqlen_k, const int& stride_logits,
                                 const int& num_heads, const int& head_dim,
-                                const int& block_q, const int& block_kv) {
+                                const int& block_q, const int& block_kv,
+                                const torch::Tensor* q_block_starts = nullptr) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 3, num_kv_stages = 3;
     const int num_math_threads = (device_runtime->get_arch_major() == 10 ? 256 : 512);
@@ -139,6 +151,7 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
         .stride_logits = stride_logits,
         .num_heads = num_heads, .head_dim = head_dim,
         .is_compressed_logits = is_compressed_logits,
+        .enable_filter_v2 = false,
         .num_q_stages = num_q_stages,
         .num_kv_stages = num_kv_stages,
         .block_q = block_q,
@@ -146,6 +159,14 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
         .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
         .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
         .logits = logits.data_ptr(),
+        .filter_thresholds = nullptr,
+        .candidate_scores = nullptr,
+        .candidate_indices = nullptr,
+        .candidate_counts = nullptr,
+        .candidate_overflow = nullptr,
+        .candidate_capacity = 0,
+        .q_block_starts =
+            q_block_starts == nullptr ? nullptr : q_block_starts->data_ptr<int>(),
         .tensor_map_q = tensor_map_q,
         .tensor_map_kv = tensor_map_kv,
         .tensor_map_kv_scales = tensor_map_kv_scales,
@@ -159,6 +180,111 @@ static void smxx_fp8_mqa_logits(const torch::Tensor& q,
     };
     const auto code = SMXXFP8MQALogitsRuntime::generate(args);
     const auto runtime = compiler->build("smxx_fp8_mqa_logits", code);
+    SMXXFP8MQALogitsRuntime::launch(runtime, args);
+}
+
+static void sm100_fp8_mqa_filter_candidates(
+        const torch::Tensor& q,
+        const torch::Tensor& kv,
+        const torch::Tensor& kv_scales,
+        const torch::Tensor& weights,
+        const torch::Tensor& cu_seq_len_k_start,
+        const torch::Tensor& cu_seq_len_k_end,
+        const torch::Tensor& thresholds,
+        torch::Tensor& candidate_scores,
+        torch::Tensor& candidate_indices,
+        torch::Tensor& candidate_counts,
+        torch::Tensor& candidate_overflow,
+        const int& candidate_capacity) {
+    constexpr int num_specialized_threads = 128;
+    constexpr int num_math_threads = 256;
+    constexpr int num_q_stages = 3;
+    constexpr int num_kv_stages = 3;
+    constexpr int block_q = 4;
+    constexpr int block_kv = 256;
+    constexpr int num_producer_warps = num_math_threads / 32;
+
+    const auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
+    const auto [seq_len_kv, kv_head_dim] = get_shape<2>(kv);
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(num_heads == 32 and head_dim == 128);
+    DG_HOST_ASSERT(kv_head_dim == head_dim);
+    DG_HOST_ASSERT(candidate_capacity > 0);
+    DG_HOST_ASSERT(candidate_capacity % 32 == 0);
+    DG_HOST_ASSERT(
+        static_cast<uint64_t>(seq_len) * num_producer_warps *
+            candidate_capacity <=
+        0xffffffffull);
+
+    const auto tensor_map_q = make_tma_2d_desc(
+        q, head_dim, seq_len * num_heads,
+        head_dim, block_q * num_heads, head_dim, head_dim);
+    const auto tensor_map_kv = make_tma_2d_desc(
+        kv, head_dim, seq_len_kv,
+        head_dim, block_kv, head_dim, head_dim);
+    const auto tensor_map_kv_scales = make_tma_2d_desc(
+        kv_scales,
+        get_tma_aligned_size(
+            seq_len_kv, static_cast<int>(kv_scales.element_size())),
+        1, block_kv, 1, 0, 0);
+    const auto tensor_map_weights = make_tma_2d_desc(
+        weights, num_heads, seq_len,
+        num_heads, block_q, num_heads, 0);
+
+    int smem_size = 0;
+    smem_size += num_q_stages * block_q * num_heads * head_dim *
+                 static_cast<int>(q.element_size());
+    smem_size += num_kv_stages * block_kv * head_dim *
+                 static_cast<int>(kv.element_size());
+    smem_size += num_q_stages * block_q * num_heads *
+                 static_cast<int>(weights.element_size());
+    smem_size += num_kv_stages * block_kv *
+                 static_cast<int>(kv_scales.element_size());
+    smem_size +=
+        (num_q_stages * 2 + num_kv_stages * 2 +
+         (num_math_threads / 128) * 2) *
+        8;
+    smem_size += 16;
+    DG_HOST_ASSERT(smem_size <= SM100ArchSpec::smem_capacity);
+
+    const SMXXFP8MQALogitsRuntime::Args args = {
+        .seq_len = static_cast<int>(seq_len),
+        .seq_len_kv = static_cast<int>(seq_len_kv),
+        .max_seqlen_k = 0,
+        .stride_logits = 0,
+        .num_heads = static_cast<int>(num_heads),
+        .head_dim = static_cast<int>(head_dim),
+        .is_compressed_logits = false,
+        .enable_filter_v2 = true,
+        .num_q_stages = num_q_stages,
+        .num_kv_stages = num_kv_stages,
+        .block_q = block_q,
+        .block_kv = block_kv,
+        .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
+        .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
+        .logits = nullptr,
+        .filter_thresholds = thresholds.data_ptr(),
+        .candidate_scores = candidate_scores.data_ptr(),
+        .candidate_indices = candidate_indices.data_ptr<int>(),
+        .candidate_counts = candidate_counts.data_ptr<int>(),
+        .candidate_overflow = candidate_overflow.data_ptr<int>(),
+        .candidate_capacity = candidate_capacity,
+        .q_block_starts = nullptr,
+        .tensor_map_q = tensor_map_q,
+        .tensor_map_kv = tensor_map_kv,
+        .tensor_map_kv_scales = tensor_map_kv_scales,
+        .tensor_map_weights = tensor_map_weights,
+        .logits_dtype = torch::kFloat,
+        .num_specialized_threads = num_specialized_threads,
+        .num_math_threads = num_math_threads,
+        .launch_args = LaunchArgs(
+            device_runtime->get_num_sms(),
+            num_specialized_threads + num_math_threads,
+            smem_size)
+    };
+    const auto code = SMXXFP8MQALogitsRuntime::generate(args);
+    const auto runtime =
+        compiler->build("sm100_fp8_mqa_filter_candidates", code);
     SMXXFP8MQALogitsRuntime::launch(runtime, args);
 }
 

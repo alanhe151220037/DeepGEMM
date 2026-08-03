@@ -136,8 +136,13 @@ target = os.path.join(pkg_dir, '_C.so')
 if os.path.exists(target):
     os.remove(target)
 shutil.copy2(lib_path, target)
+source_target = os.path.join(root_dir, 'deep_gemm', '_C.so')
+if os.path.exists(source_target):
+    os.remove(source_target)
+shutil.copy2(lib_path, source_target)
 shutil.rmtree(build_subdir, ignore_errors=True)
 print(f"Built {target}")
+print(f"Updated source extension {source_target}")
 PY
 
 echo "--- Installing build frontend ---"

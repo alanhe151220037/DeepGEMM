@@ -2,6 +2,7 @@
 
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
+#include <cuda_bf16.h>
 
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
@@ -18,7 +19,7 @@
 namespace deep_gemm {
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsCompressedLogits,
+          bool kIsCompressedLogits, bool kEnableFilterV2,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -31,6 +32,13 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                           uint32_t* cu_seq_len_k_start,
                           uint32_t* cu_seq_len_k_end,
                           logits_dtype_t* logits,
+                          const __nv_bfloat16* filter_thresholds,
+                          __nv_bfloat16* candidate_scores,
+                          int32_t* candidate_indices,
+                          int32_t* candidate_counts,
+                          int32_t* candidate_overflow,
+                          const uint32_t candidate_capacity,
+                          const int32_t* q_block_starts,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                           const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
@@ -39,7 +47,9 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // Normally, `h (kNumHeads) == 32` and `d (kHeadDim) == 64`
     // For one block, we process `[q_start:q_end, h, d] @ [kv_start:kv_end, d] -> [q_start:q_end, kv_start:kv_end]`
     // Q should be load only at once for a block
-    const auto num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
+    const auto num_q_blocks =
+        q_block_starts == nullptr ? math::ceil_div(seq_len, BLOCK_Q) : seq_len;
+    constexpr uint32_t kNumProducerWarps = kNumMathThreads / 32;
 
     // Types
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
@@ -144,6 +154,24 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
     // Block scheduler
     uint32_t block_q_idx = sm_idx, q_iter_idx = 0;
+    const auto get_block_q_start = [&](const uint32_t idx) -> uint32_t {
+        return q_block_starts == nullptr
+                   ? idx * BLOCK_Q
+                   : static_cast<uint32_t>(q_block_starts[idx]);
+    };
+    const auto has_block = [&](const uint32_t idx) -> bool {
+        return idx < num_q_blocks and get_block_q_start(idx) < seq_len;
+    };
+    const auto get_block_q_end = [&](const uint32_t idx) -> uint32_t {
+        const auto q_start = get_block_q_start(idx);
+        if (q_block_starts == nullptr)
+            return min(q_start + BLOCK_Q, seq_len);
+        const auto next_start =
+            idx + 1 < num_q_blocks
+                ? static_cast<uint32_t>(q_block_starts[idx + 1])
+                : seq_len;
+        return min(q_start + BLOCK_Q, min(next_start, seq_len));
+    };
     const auto get_next_block_q_idx = [&]() -> cute::tuple<uint32_t, uint32_t> {
         return {block_q_idx + kNumSMs, q_iter_idx + 1};
     };
@@ -151,10 +179,12 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     const auto load_schedule = [&](const uint32_t& q_iter_offset = 0) -> cute::tuple<uint32_t, uint32_t, uint32_t, uint32_t> {
         uint32_t start = cute::numeric_limits<uint32_t>::max();
         uint32_t end = cute::numeric_limits<uint32_t>::min();
+        const auto block_q_start = get_block_q_start(block_q_idx);
+        const auto block_q_end = get_block_q_end(block_q_idx);
 
         #pragma unroll
         for (uint32_t i = 0; i < BLOCK_Q; ++ i) {
-            const auto q_idx = min(block_q_idx * BLOCK_Q + i, seq_len - 1);
+            const auto q_idx = min(block_q_start + i, block_q_end - 1);
             seq_k_start[i] = cu_seq_len_k_start[q_idx];
             seq_k_end[i] = cu_seq_len_k_end[q_idx];
             start = min(start, min(seq_k_start[i], seq_len_kv));
@@ -190,23 +220,25 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
         // Prefetch
         const auto issue_tma_q = [&](const uint32_t& stage_idx, const auto& block_idx) {
-            tma::copy<kHeadDim, BLOCK_Q * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, block_idx * BLOCK_Q * kNumHeads);
-            tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, block_idx * BLOCK_Q);
+            const auto q_start = get_block_q_start(block_idx);
+            tma::copy<kHeadDim, BLOCK_Q * kNumHeads, kHeadDim>(&tensor_map_q, full_q_barriers[stage_idx], smem_q[stage_idx], 0, q_start * kNumHeads);
+            tma::copy<kNumHeads, BLOCK_Q, 0>(&tensor_map_weights, full_q_barriers[stage_idx], smem_weights[stage_idx], 0, q_start);
             full_q_barriers[stage_idx]->arrive_and_expect_tx(SMEM_Q_SIZE_PER_STAGE + SMEM_WEIGHT_SIZE_PER_STAGE);
         };
-        if (cute::elect_one_sync() and block_q_idx < num_q_blocks)
+        if (cute::elect_one_sync() and has_block(block_q_idx))
             issue_tma_q(0, block_q_idx);
 
         // Only the first lane persistently schedules over blocks
         if (cute::elect_one_sync()) {
-            while (block_q_idx < num_q_blocks) {
+            while (has_block(block_q_idx)) {
                 CUTE_TIE_DECL(load_schedule(1), q_stage_idx, q_phase, kv_start, num_kv_blocks);
 
                 // Wait Q consumer release
                 empty_q_barriers[q_stage_idx]->wait(q_phase ^ 1);
 
                 // Issue TMA Q
-                if (const auto& next_block_q_idx = cute::get<0>(get_next_block_q_idx()); next_block_q_idx < num_q_blocks)
+                if (const auto& next_block_q_idx = cute::get<0>(get_next_block_q_idx());
+                    has_block(next_block_q_idx))
                     issue_tma_q(q_stage_idx, next_block_q_idx);
 
                 // Issue TMA KV
@@ -240,7 +272,7 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                                                       UMMA_M, UMMA_N, cute::UMMA::Major::K, cute::UMMA::Major::K>();
         auto runtime_instr_desc = cute::UMMA::make_runtime_instr_desc(instr_desc);
 
-        while (block_q_idx < num_q_blocks) {
+        while (has_block(block_q_idx)) {
             CUTE_TIE_DECL(load_schedule(), q_stage_idx, q_phase, kv_start, num_kv_blocks);
 
             // Wait TMA Q arrival
@@ -281,7 +313,9 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
             // Jump to the next block
             CUTE_TIE(get_next_block_q_idx(), block_q_idx, q_iter_idx);
         }
-    } else if (warp_idx == kSpecWarpStart + 2 or warp_idx == kSpecWarpStart + 3) {
+    } else if (warp_idx == kSpecWarpStart + 2) {
+        cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
+    } else if (warp_idx == kSpecWarpStart + 3) {
         cutlass::arch::warpgroup_reg_dealloc<kNumSpecializedRegisters>();
     } else if (warp_idx < kSpecWarpStart) {
         cutlass::arch::warpgroup_reg_alloc<kNumMathRegisters>();
@@ -305,9 +339,23 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
 
         // Local register buffers
         float weights[BLOCK_Q][kNumHeads];
+        float filter_threshold_values[BLOCK_Q] = {};
+        uint32_t filter_lane_counts[BLOCK_Q] = {};
+        uint32_t filter_lane_bases[BLOCK_Q] = {};
+        bool filter_q_valid[BLOCK_Q] = {};
+        const uint32_t filter_lane_capacity = candidate_capacity / 32;
 
-        while (block_q_idx < num_q_blocks) {
+        while (has_block(block_q_idx)) {
             CUTE_TIE_DECL(load_schedule(), q_stage_idx, q_phase, kv_start, num_kv_blocks);
+            const uint32_t block_q_start = get_block_q_start(block_q_idx);
+            const uint32_t block_q_end = get_block_q_end(block_q_idx);
+            uint32_t block_window_start = seq_k_start[0];
+            uint32_t block_window_end = seq_k_end[0];
+            #pragma unroll
+            for (uint32_t row = 1; row < BLOCK_Q; ++row) {
+                block_window_start = min(block_window_start, seq_k_start[row]);
+                block_window_end = max(block_window_end, seq_k_end[row]);
+            }
 
             // Wait TMA Q arrival
             full_q_barriers[q_stage_idx]->wait(q_phase);
@@ -318,6 +366,25 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 #pragma unroll
                 for (uint32_t j = 0; j < kNumHeads; ++ j)
                     weights[i][j] = ptx::ld_shared(smem_weights[q_stage_idx] + i * kNumHeads + j);
+            }
+
+            if constexpr (kEnableFilterV2) {
+                #pragma unroll
+                for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+                    filter_lane_counts[i] = 0;
+                    const uint32_t raw_q_idx = block_q_start + i;
+                    const uint32_t q_idx = min(raw_q_idx, seq_len - 1);
+                    filter_q_valid[i] = raw_q_idx < block_q_end;
+                    filter_threshold_values[i] =
+                        reinterpret_cast<const float*>(
+                            filter_thresholds)[q_idx];
+                    const uint32_t filter_output_base =
+                        (q_idx * kNumProducerWarps + warp_idx) *
+                        candidate_capacity;
+                    filter_lane_bases[i] =
+                        filter_output_base +
+                        lane_idx * filter_lane_capacity;
+                }
             }
 
             // Compute over KV blocks
@@ -339,7 +406,10 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                 empty_kv_barriers[kv_stage_idx]->arrive();
 
                 // Reduce over the head dim and store
-                const auto kv_offset = kv_start + kv_block_idx * BLOCK_KV + math_thread_idx;
+                const auto kv_block_start =
+                    kv_start + kv_block_idx * BLOCK_KV;
+                const auto kv_offset =
+                    kv_block_start + math_thread_idx;
                 DG_STATIC_ASSERT(kNumHeads % 8 == 0, "Invalid head");
 
                 #pragma unroll
@@ -371,21 +441,77 @@ void sm100_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                     }
 
                     auto sum = __fadd2_rn(sum_0, sum_1);
-                    auto result = static_cast<logits_dtype_t>(scale_kv * (sum.x + sum.y));
+                    const float result_fp32 = scale_kv * (sum.x + sum.y);
 
-                    // Store into the global memory
-                    const auto q_offset = (block_q_idx * BLOCK_Q + i) * static_cast<uint64_t>(stride_logits);
-                    if constexpr (kIsCompressedLogits) {
-                        if (seq_k_start[i] <= kv_offset and kv_offset < seq_k_end[i])
-                            logits[q_offset + kv_offset - seq_k_start[i]] = result;
+                    if constexpr (kEnableFilterV2) {
+                        const bool valid =
+                            filter_q_valid[i] and
+                            seq_k_start[i] <= kv_offset and
+                            kv_offset < seq_k_end[i];
+                        const bool accepted =
+                            valid and isfinite(result_fp32) and
+                            result_fp32 >= filter_threshold_values[i];
+                        const uint32_t lane_count = filter_lane_counts[i];
+                        const bool has_capacity =
+                            lane_count < filter_lane_capacity;
+                        const uint32_t should_store =
+                            accepted and has_capacity;
+                        const uint32_t store_slot =
+                            has_capacity ? lane_count : 0;
+                        const uint32_t dst =
+                            filter_lane_bases[i] + store_slot;
+                        const uint32_t filter_candidate_index =
+                            kv_offset - seq_k_start[i];
+                        ptx::st_no_allocate_if(
+                            reinterpret_cast<float*>(candidate_scores) + dst,
+                            result_fp32,
+                            should_store);
+                        ptx::st_no_allocate_if(
+                            reinterpret_cast<uint32_t*>(candidate_indices) + dst,
+                            filter_candidate_index,
+                            should_store);
+                        filter_lane_counts[i] =
+                            lane_count + static_cast<uint32_t>(accepted);
                     } else {
-                        logits[q_offset + kv_offset] = result;
+                        auto result = static_cast<logits_dtype_t>(result_fp32);
+                        const uint32_t q_idx = block_q_start + i;
+                        const auto q_offset = q_idx * static_cast<uint64_t>(stride_logits);
+                        if constexpr (kIsCompressedLogits) {
+                            if (q_idx < block_q_end and
+                                block_window_start <= kv_offset and
+                                kv_offset < block_window_end)
+                                logits[
+                                    q_offset + kv_offset -
+                                    block_window_start] = result;
+                        } else {
+                            logits[q_offset + kv_offset] = result;
+                        }
                     }
                     __syncwarp();
                 }
             }
             num_total_kv_blocks += num_kv_blocks;
 
+            if constexpr (kEnableFilterV2) {
+                #pragma unroll
+                for (uint32_t i = 0; i < BLOCK_Q; ++i) {
+                    const uint32_t q_idx = block_q_start + i;
+                    if (q_idx < block_q_end) {
+                        const uint32_t lane_count = filter_lane_counts[i];
+                        const uint64_t output_offset =
+                            (static_cast<uint64_t>(q_idx) *
+                                 kNumProducerWarps +
+                             warp_idx) *
+                                32 +
+                            lane_idx;
+                        candidate_counts[output_offset] =
+                            static_cast<int32_t>(
+                                min(lane_count, filter_lane_capacity));
+                        candidate_overflow[output_offset] =
+                            lane_count > filter_lane_capacity ? 1 : 0;
+                    }
+                }
+            }
             // Release Q empty
             empty_q_barriers[q_stage_idx]->arrive();
 

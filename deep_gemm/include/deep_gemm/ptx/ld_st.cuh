@@ -167,6 +167,58 @@ CUTLASS_DEVICE void st_relaxed_sys(const uint64_t* ptr, const uint64_t& value) {
     asm volatile("st.L1::no_allocate.relaxed.sys.global.u64 [%0], %1;" :: "l"(ptr), "l"(value));
 }
 
+CUTLASS_DEVICE void st_no_allocate(const uint16_t* ptr, const uint16_t& value) {
+    asm volatile("st.L1::no_allocate.relaxed.gpu.global.u16 [%0], %1;" ::
+                 "l"(ptr), "h"(value));
+}
+
+CUTLASS_DEVICE void st_no_allocate(const uint32_t* ptr, const uint32_t& value) {
+    asm volatile("st.L1::no_allocate.relaxed.gpu.global.u32 [%0], %1;" ::
+                 "l"(ptr), "r"(value));
+}
+
+CUTLASS_DEVICE void st_no_allocate_if(
+        const uint32_t* ptr, const uint32_t& value, const uint32_t& predicate) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.u32 p, %2, 0;\n"
+        "  @p st.L1::no_allocate.relaxed.gpu.global.u32 [%0], %1;\n"
+        "}" ::
+        "l"(ptr), "r"(value), "r"(predicate));
+}
+
+CUTLASS_DEVICE void st_no_allocate_if(
+        const float* ptr, const float& value, const uint32_t& predicate) {
+    asm volatile(
+        "{\n"
+        "  .reg .pred p;\n"
+        "  setp.ne.u32 p, %2, 0;\n"
+        "  @p st.L1::no_allocate.relaxed.gpu.global.f32 [%0], %1;\n"
+        "}" ::
+        "l"(ptr), "f"(value), "r"(predicate));
+}
+
+CUTLASS_DEVICE void st_no_allocate(const float* ptr, const float& value) {
+    asm volatile("st.L1::no_allocate.relaxed.gpu.global.f32 [%0], %1;" ::
+                 "l"(ptr), "f"(value));
+}
+
+CUTLASS_DEVICE void st_no_allocate(
+        const void* ptr, uint32_t x, uint32_t y) {
+    asm volatile(
+        "st.L1::no_allocate.relaxed.gpu.global.v2.u32 [%0], {%1, %2};" ::
+        "l"(ptr), "r"(x), "r"(y));
+}
+
+CUTLASS_DEVICE void st_no_allocate(
+        const void* ptr, uint32_t x, uint32_t y, uint32_t z, uint32_t w) {
+    asm volatile(
+        "st.L1::no_allocate.relaxed.gpu.global.v4.u32 "
+        "[%0], {%1, %2, %3, %4};" ::
+        "l"(ptr), "r"(x), "r"(y), "r"(z), "r"(w));
+}
+
 /// Atomics
 CUTLASS_DEVICE uint64_t atomic_add(const uint64_t* ptr, const uint64_t& value) {
     uint64_t ret;

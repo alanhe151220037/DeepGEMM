@@ -227,6 +227,163 @@ try:
         (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
         return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
 
+    def fp8_mqa_logits_bf16(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+        (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
+        return _C.fp8_mqa_logits_bf16(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
+
+    def fp8_mqa_backward_logits(
+        q, kv, weights, window_starts, ke, q_block_starts,
+        backward_len=65536, output_len=None
+    ):
+        (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
+        if output_len is None:
+            output_len = ((backward_len + 3 + 255) // 256) * 256
+        return _C.fp8_mqa_backward_logits(
+            q, kv_data, kv_sf, weights, window_starts, ke,
+            q_block_starts, backward_len, output_len
+        )
+
+    def build_mqa_backward_metadata(
+        ks, ke, request_q_lengths, backward_len=65536, block_q=4
+    ):
+        if sum(request_q_lengths) != ks.numel():
+            raise ValueError("sum(request_q_lengths) must equal ks.numel()")
+        window_starts = torch.maximum(ks, ke - backward_len).contiguous()
+        block_starts = []
+        request_start = 0
+        for request_len in request_q_lengths:
+            block_starts.extend(
+                range(request_start, request_start + request_len, block_q)
+            )
+            request_start += request_len
+        q_block_starts = torch.full_like(ks, -1)
+        row_block_bases = []
+        if block_starts:
+            q_block_starts[:len(block_starts)] = torch.tensor(
+                block_starts, dtype=torch.int32, device=ks.device
+            )
+        request_start = 0
+        for request_len in request_q_lengths:
+            for block_start in range(
+                request_start, request_start + request_len, block_q
+            ):
+                block_end = min(
+                    block_start + block_q, request_start + request_len
+                )
+                row_block_bases.extend([block_start] * (block_end - block_start))
+            request_start += request_len
+        block_base_indices = torch.tensor(
+            row_block_bases, dtype=torch.int64, device=ks.device
+        )
+        topk_row_starts = (
+            window_starts - window_starts[block_base_indices]
+        ).to(torch.int32).contiguous()
+        max_block_delta = (
+            int(topk_row_starts.max().item()) if topk_row_starts.numel() != 0 else 0
+        )
+        logits_width = ((backward_len + max_block_delta + 255) // 256) * 256
+        return window_starts, q_block_starts, topk_row_starts, logits_width
+
+    def fp8_mqa_backward_topk(
+        logits,
+        ks,
+        ke,
+        row_starts,
+        backward_len=65536,
+        topk=2048,
+        index_starts=None,
+    ):
+        if topk != 2048:
+            raise ValueError("fp8_mqa_backward_topk currently supports topk=2048")
+        if logits.dim() != 2 or logits.shape[0] != ks.numel():
+            raise ValueError(
+                "logits must have shape [ks.numel(), logits_width]"
+            )
+        lengths = (ke - ks).clamp(min=0, max=backward_len).to(torch.int32)
+        required_width = int(
+            (row_starts.to(torch.int64) + lengths.to(torch.int64)).max().item()
+        ) if lengths.numel() != 0 else 0
+        if logits.shape[1] < required_width:
+            raise ValueError(
+                f"logits.shape[1] must be >= max(row_starts + lengths), "
+                f"got {logits.shape[1]} < {required_width}"
+            )
+        if index_starts is None:
+            index_starts = torch.maximum(ks, ke - backward_len)
+        if index_starts.numel() != ks.numel():
+            raise ValueError("index_starts must have one element per logits row")
+        index_starts = index_starts.to(
+            device=logits.device, dtype=torch.int32
+        ).contiguous()
+        scores = torch.empty(
+            (logits.shape[0], topk), device=logits.device, dtype=logits.dtype
+        )
+        global_indices = torch.empty(
+            (logits.shape[0], topk), device=logits.device, dtype=torch.int32
+        )
+        _C.fp8_mqa_backward_topk(
+            logits,
+            lengths,
+            row_starts.to(torch.int32),
+            index_starts,
+            scores,
+            global_indices,
+        )
+        return scores, global_indices
+
+    def fp8_mqa_filter_candidates(
+        q,
+        kv,
+        weights,
+        ks,
+        ke,
+        thresholds,
+        candidate_capacity_per_warp=8192,
+        index_base=None,
+    ):
+        (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
+        if index_base not in (None, 0):
+            raise ValueError(
+                "V2 candidate indices are request-local; nonzero index_base "
+                "is no longer supported"
+            )
+        num_queries = q.shape[0]
+        output_capacity = candidate_capacity_per_warp
+        shape = (num_queries, 8, output_capacity)
+        scores = torch.empty(shape, device=q.device, dtype=torch.float32)
+        indices = torch.empty(shape, device=q.device, dtype=torch.int32)
+        counts = torch.zeros((num_queries, 8, 32), device=q.device, dtype=torch.int32)
+        overflow = torch.zeros_like(counts)
+        _C.fp8_mqa_filter_candidates(
+            q, kv_data, kv_sf, weights, ks, ke, thresholds,
+            scores, indices, counts, overflow, output_capacity)
+        return scores, indices, counts, overflow
+
+    def mqa_final_topk(
+            prefix_scores, prefix_indices, candidate_scores, candidate_indices,
+            candidate_counts, page_table_size_1, cu_seqlens_q,
+            transform_offsets=None, transform_indices=True):
+        if transform_offsets is None:
+            transform_offsets = torch.empty(
+                0, device=prefix_scores.device, dtype=torch.int32
+            )
+        output_scores = torch.empty_like(prefix_scores)
+        output_indices = torch.empty_like(prefix_indices)
+        _C.mqa_final_topk(
+            prefix_scores,
+            prefix_indices,
+            candidate_scores,
+            candidate_indices,
+            candidate_counts,
+            page_table_size_1,
+            cu_seqlens_q,
+            transform_offsets,
+            transform_indices,
+            output_scores,
+            output_indices,
+        )
+        return output_scores, output_indices
+
     def fp8_fp4_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, logits_dtype=torch.float, indices=None):
         logits_dtype_str = str(logits_dtype).split('.')[-1]
         (q, q_sf) = _parse_tensor_or_tuple(q)
@@ -265,6 +422,129 @@ try:
 
 except AttributeError:
     pass
+
+def build_mqa_backward_metadata(
+    ks, ke, request_q_lengths, backward_len=65536, block_q=4
+):
+    if sum(request_q_lengths) != ks.numel():
+        raise ValueError("sum(request_q_lengths) must equal ks.numel()")
+    window_starts = torch.maximum(ks, ke - backward_len).contiguous()
+    block_starts = []
+    request_start = 0
+    for request_len in request_q_lengths:
+        block_starts.extend(
+            range(request_start, request_start + request_len, block_q)
+        )
+        request_start += request_len
+    q_block_starts = torch.full_like(ks, -1)
+    row_block_bases = []
+    if block_starts:
+        q_block_starts[:len(block_starts)] = torch.tensor(
+            block_starts, dtype=torch.int32, device=ks.device
+        )
+    request_start = 0
+    for request_len in request_q_lengths:
+        for block_start in range(
+            request_start, request_start + request_len, block_q
+        ):
+            block_end = min(
+                block_start + block_q, request_start + request_len
+            )
+            row_block_bases.extend([block_start] * (block_end - block_start))
+        request_start += request_len
+    block_base_indices = torch.tensor(
+        row_block_bases, dtype=torch.int64, device=ks.device
+    )
+    topk_row_starts = (
+        window_starts - window_starts[block_base_indices]
+    ).to(torch.int32).contiguous()
+    max_block_delta = (
+        int(topk_row_starts.max().item()) if topk_row_starts.numel() != 0 else 0
+    )
+    logits_width = ((backward_len + max_block_delta + 255) // 256) * 256
+    return window_starts, q_block_starts, topk_row_starts, logits_width
+
+def fp8_mqa_backward_logits(
+    q, kv, weights, window_starts, ke, q_block_starts,
+    backward_len=65536, output_len=None
+):
+    (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
+    if output_len is None:
+        output_len = ((backward_len + 3 + 255) // 256) * 256
+    return _C.fp8_mqa_backward_logits(
+        q, kv_data, kv_sf, weights, window_starts, ke,
+        q_block_starts, backward_len, output_len
+    )
+
+def fp8_mqa_backward_topk(
+    logits,
+    ks,
+    ke,
+    row_starts,
+    backward_len=65536,
+    topk=2048,
+    index_starts=None,
+):
+    if topk != 2048:
+        raise ValueError("fp8_mqa_backward_topk currently supports topk=2048")
+    if logits.dim() != 2 or logits.shape[0] != ks.numel():
+        raise ValueError("logits must have shape [ks.numel(), logits_width]")
+    lengths = (ke - ks).clamp(min=0, max=backward_len).to(torch.int32)
+    required_width = int(
+        (row_starts.to(torch.int64) + lengths.to(torch.int64)).max().item()
+    ) if lengths.numel() != 0 else 0
+    if logits.shape[1] < required_width:
+        raise ValueError(
+            f"logits.shape[1] must be >= max(row_starts + lengths), "
+            f"got {logits.shape[1]} < {required_width}"
+        )
+    if index_starts is None:
+        index_starts = torch.maximum(ks, ke - backward_len)
+    if index_starts.numel() != ks.numel():
+        raise ValueError("index_starts must have one element per logits row")
+    index_starts = index_starts.to(
+        device=logits.device, dtype=torch.int32
+    ).contiguous()
+    scores = torch.empty(
+        (logits.shape[0], topk), device=logits.device, dtype=logits.dtype
+    )
+    global_indices = torch.empty(
+        (logits.shape[0], topk), device=logits.device, dtype=torch.int32
+    )
+    _C.fp8_mqa_backward_topk(
+        logits,
+        lengths,
+        row_starts.to(torch.int32),
+        index_starts,
+        scores,
+        global_indices,
+    )
+    return scores, global_indices
+
+def mqa_final_topk(
+        prefix_scores, prefix_indices, candidate_scores, candidate_indices,
+        candidate_counts, page_table_size_1, cu_seqlens_q,
+        transform_offsets=None, transform_indices=True):
+    if transform_offsets is None:
+        transform_offsets = torch.empty(
+            0, device=prefix_scores.device, dtype=torch.int32
+        )
+    output_scores = torch.empty_like(prefix_scores)
+    output_indices = torch.empty_like(prefix_indices)
+    _C.mqa_final_topk(
+        prefix_scores,
+        prefix_indices,
+        candidate_scores,
+        candidate_indices,
+        candidate_counts,
+        page_table_size_1,
+        cu_seqlens_q,
+        transform_offsets,
+        transform_indices,
+        output_scores,
+        output_indices,
+    )
+    return output_scores, output_indices
 
 # Mega kernels
 from .mega import (

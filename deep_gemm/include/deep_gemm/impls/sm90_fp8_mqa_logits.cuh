@@ -2,6 +2,7 @@
 
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
+#include <cuda_bf16.h>
 
 #include <cute/arch/cluster_sm90.hpp>
 #include <cute/arch/copy_sm90_desc.hpp>
@@ -20,7 +21,7 @@
 namespace deep_gemm {
 
 template <uint32_t kNumHeads, uint32_t kHeadDim,
-          bool kIsCompressedLogits,
+          bool kIsCompressedLogits, bool kEnableFilterV2,
           uint32_t BLOCK_Q, uint32_t BLOCK_KV,
           uint32_t kNumQStages, uint32_t kNumKVStages,
           uint32_t kNumSMs,
@@ -32,6 +33,13 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
                          uint32_t* cu_seq_len_k_start,
                          uint32_t* cu_seq_len_k_end,
                          logits_dtype_t* logits,
+                         const __nv_bfloat16* filter_thresholds,
+                         __nv_bfloat16* candidate_scores,
+                         int32_t* candidate_indices,
+                         int32_t* candidate_counts,
+                         int32_t* candidate_overflow,
+                         const uint32_t candidate_capacity,
+                         const int32_t* q_block_starts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_kv_scales,
@@ -40,6 +48,9 @@ void sm90_fp8_mqa_logits(const uint32_t seq_len, const uint32_t seq_len_kv,
     // For one block, we process `[q_start:q_end, h, d] @ [kv_start:kv_end, d] -> [q_start:q_end, kv_start:kv_end]`
     // Q should be load only at once for a block
     const auto num_q_blocks = math::ceil_div(seq_len, BLOCK_Q);
+    DG_STATIC_ASSERT(not kEnableFilterV2,
+                     "MQA candidate filtering is only supported on SM100");
+    (void)q_block_starts;
 
     // Types
     using WGMMA = typename mma::sm90::FP8MMASelector<BLOCK_Q * kNumHeads>::type;
