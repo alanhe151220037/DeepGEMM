@@ -11,6 +11,9 @@
 #include "../jit_kernels/impls/sm120_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm120_paged_mqa_logits.hpp"
 #include "../jit_kernels/impls/sm90_fp8_mqa_logits.hpp"
+#include "../jit_kernels/impls/sm100_long_context_mqa_logits.hpp"
+#include "../jit_kernels/impls/smxx_mqa_backward_topk.hpp"
+#include "../jit_kernels/impls/smxx_mqa_final_topk.hpp"
 #include "../jit_kernels/impls/smxx_clean_logits.hpp"
 #endif
 
@@ -438,6 +441,188 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
     return fp8_fp4_mqa_logits(std::make_tuple(q, std::nullopt), kv, weights, 
                               cu_seq_len_k_start, cu_seq_len_k_end,
                               clean_logits, max_seqlen_k, torch::kFloat);
+}
+
+static torch::Tensor fp8_mqa_logits_bf16(
+        const torch::Tensor& q,
+        const std::tuple<torch::Tensor, torch::Tensor>& kv,
+        const torch::Tensor& weights,
+        const torch::Tensor& cu_seq_len_k_start,
+        const torch::Tensor& cu_seq_len_k_end,
+        const bool& clean_logits,
+        const int& max_seqlen_k) {
+    return fp8_fp4_mqa_logits(
+        std::make_tuple(q, std::nullopt), kv, weights,
+        cu_seq_len_k_start, cu_seq_len_k_end,
+        clean_logits, max_seqlen_k, torch::kBFloat16);
+}
+
+static torch::Tensor fp8_mqa_backward_logits(
+        const torch::Tensor& q,
+        const std::tuple<torch::Tensor, torch::Tensor>& kv,
+        const torch::Tensor& weights,
+        const torch::Tensor& window_starts,
+        const torch::Tensor& cu_seq_len_k_end,
+        const torch::Tensor& q_block_starts,
+        const int& backward_len,
+        const int& output_len) {
+    const auto& [kv_data, kv_scales] = kv;
+    const auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
+    const auto [seq_len_kv, kv_head_dim] = get_shape<2>(kv_data);
+
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(num_heads == 32 and head_dim == 128);
+    DG_HOST_ASSERT(kv_head_dim == head_dim);
+    DG_HOST_ASSERT(backward_len > 0);
+    DG_HOST_ASSERT(q.is_contiguous());
+    DG_HOST_ASSERT(q.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(kv_data.is_contiguous());
+    DG_HOST_ASSERT(kv_data.scalar_type() == torch::kFloat8_e4m3fn);
+    DG_HOST_ASSERT(kv_scales.is_contiguous());
+    DG_HOST_ASSERT(kv_scales.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(weights.stride(1) == 1);
+    DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(window_starts.numel() == seq_len);
+    DG_HOST_ASSERT(cu_seq_len_k_end.numel() == seq_len);
+    DG_HOST_ASSERT(q_block_starts.numel() == seq_len);
+    DG_HOST_ASSERT(window_starts.is_contiguous());
+    DG_HOST_ASSERT(cu_seq_len_k_end.is_contiguous());
+    DG_HOST_ASSERT(q_block_starts.is_contiguous());
+    DG_HOST_ASSERT(window_starts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(cu_seq_len_k_end.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(q_block_starts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(output_len >= backward_len);
+
+    constexpr int block_q = 4;
+    constexpr int block_kv = 256;
+    const int stride_logits = align(output_len, block_kv);
+    auto logits_storage = torch::empty(
+        {seq_len, stride_logits}, q.options().dtype(torch::kFloat));
+    auto logits = logits_storage.index(
+        {torch::indexing::Slice(),
+         torch::indexing::Slice(0, output_len)});
+
+    sm100_long_context_mqa_logits(
+        q,
+        kv_data,
+        kv_scales,
+        weights,
+        window_starts,
+        cu_seq_len_k_end,
+        logits,
+        torch::kFloat,
+        seq_len,
+        seq_len_kv,
+        output_len,
+        stride_logits,
+        num_heads,
+        head_dim,
+        block_q,
+        block_kv,
+        &q_block_starts);
+    return logits;
+}
+
+static void fp8_mqa_backward_topk(
+        const torch::Tensor& logits,
+        const torch::Tensor& lengths,
+        const torch::Tensor& row_starts,
+        const torch::Tensor& window_starts,
+        torch::Tensor& scores,
+        torch::Tensor& indices) {
+    DG_HOST_ASSERT(logits.dim() == 2);
+    DG_HOST_ASSERT(lengths.numel() == logits.size(0));
+    DG_HOST_ASSERT(row_starts.numel() == logits.size(0));
+    DG_HOST_ASSERT(window_starts.numel() == logits.size(0));
+    DG_HOST_ASSERT(scores.dim() == 2 and scores.size(0) == logits.size(0));
+    DG_HOST_ASSERT(indices.dim() == 2 and indices.size(0) == logits.size(0));
+    DG_HOST_ASSERT(scores.size(1) == 2048 and indices.size(1) == 2048);
+    DG_HOST_ASSERT(scores.scalar_type() == logits.scalar_type());
+    DG_HOST_ASSERT(indices.scalar_type() == torch::kInt32);
+    smxx_mqa_backward_topk(
+        logits, lengths, row_starts, window_starts, scores, indices);
+}
+
+static void fp8_mqa_filter_candidates(
+        const torch::Tensor& q,
+        const std::tuple<torch::Tensor, torch::Tensor>& kv,
+        const torch::Tensor& weights,
+        const torch::Tensor& cu_seq_len_k_start,
+        const torch::Tensor& cu_seq_len_k_end,
+        const torch::Tensor& thresholds,
+        torch::Tensor& candidate_scores,
+        torch::Tensor& candidate_indices,
+        torch::Tensor& candidate_counts,
+        torch::Tensor& candidate_overflow,
+        const int& candidate_capacity) {
+    const auto& [kv_data, kv_scales] = kv;
+    const auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
+    const auto [seq_len_kv, kv_head_dim] = get_shape<2>(kv_data);
+
+    DG_HOST_ASSERT(device_runtime->get_arch_major() == 10);
+    DG_HOST_ASSERT(num_heads == 32 and head_dim == 128);
+    DG_HOST_ASSERT(kv_head_dim == head_dim);
+    DG_HOST_ASSERT(thresholds.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(thresholds.numel() == seq_len);
+    DG_HOST_ASSERT(candidate_scores.scalar_type() == torch::kFloat);
+    DG_HOST_ASSERT(candidate_indices.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(candidate_counts.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(candidate_overflow.scalar_type() == torch::kInt);
+    DG_HOST_ASSERT(candidate_scores.numel() ==
+                   seq_len * 8 * candidate_capacity);
+    DG_HOST_ASSERT(candidate_indices.numel() ==
+                   seq_len * 8 * candidate_capacity);
+    DG_HOST_ASSERT(candidate_counts.numel() == seq_len * 8 * 32);
+    DG_HOST_ASSERT(candidate_overflow.numel() == seq_len * 8 * 32);
+    DG_HOST_ASSERT(thresholds.is_contiguous());
+    DG_HOST_ASSERT(candidate_scores.is_contiguous());
+    DG_HOST_ASSERT(candidate_indices.is_contiguous());
+    DG_HOST_ASSERT(candidate_counts.is_contiguous());
+    DG_HOST_ASSERT(candidate_overflow.is_contiguous());
+
+    sm100_fp8_mqa_filter_candidates(
+        q, kv_data, kv_scales, weights,
+        cu_seq_len_k_start, cu_seq_len_k_end, thresholds,
+        candidate_scores, candidate_indices, candidate_counts,
+        candidate_overflow, candidate_capacity);
+}
+
+static void mqa_final_topk(
+        const torch::Tensor& prefix_scores,
+        const torch::Tensor& prefix_indices,
+        const torch::Tensor& candidate_scores,
+        const torch::Tensor& candidate_indices,
+        const torch::Tensor& candidate_counts,
+        const torch::Tensor& page_table,
+        const torch::Tensor& cu_seqlens_q,
+        const torch::Tensor& transform_offsets,
+        const bool& transform_indices,
+        torch::Tensor& output_scores,
+        torch::Tensor& output_indices) {
+    DG_HOST_ASSERT(prefix_scores.dim() == 2);
+    DG_HOST_ASSERT(prefix_scores.size(1) == 2048);
+    DG_HOST_ASSERT(prefix_indices.sizes() == prefix_scores.sizes());
+    DG_HOST_ASSERT(candidate_scores.dim() == 3);
+    DG_HOST_ASSERT(candidate_scores.size(0) == prefix_scores.size(0));
+    DG_HOST_ASSERT(candidate_scores.size(1) == 8);
+    DG_HOST_ASSERT(candidate_indices.sizes() == candidate_scores.sizes());
+    DG_HOST_ASSERT(candidate_counts.dim() == 3);
+    DG_HOST_ASSERT(candidate_counts.size(0) == prefix_scores.size(0));
+    DG_HOST_ASSERT(candidate_counts.size(1) == 8);
+    DG_HOST_ASSERT(candidate_counts.size(2) == 32);
+    DG_HOST_ASSERT(page_table.dim() == 2);
+    DG_HOST_ASSERT(cu_seqlens_q.dim() == 1);
+    DG_HOST_ASSERT(cu_seqlens_q.size(0) == page_table.size(0) + 1);
+    DG_HOST_ASSERT(transform_offsets.dim() == 1);
+    DG_HOST_ASSERT(
+        transform_offsets.numel() == 0 or
+        transform_offsets.numel() == page_table.size(0));
+    DG_HOST_ASSERT(output_scores.sizes() == prefix_scores.sizes());
+    DG_HOST_ASSERT(output_indices.sizes() == prefix_scores.sizes());
+    smxx_mqa_final_topk(
+        prefix_scores, prefix_indices, candidate_scores, candidate_indices,
+        candidate_counts, page_table, cu_seqlens_q, transform_offsets,
+        transform_indices, output_scores, output_indices);
 }
 
 static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,

@@ -571,6 +571,102 @@ Tensor dg_fp8_mqa_logits(TensorView q, TensorView kv_data, TensorView kv_sf,
     return Tensor::FromDLPack(at::toDLPack(result));
 }
 
+Tensor dg_fp8_mqa_logits_bf16(
+        TensorView q, TensorView kv_data, TensorView kv_sf,
+        TensorView weights, TensorView cu_seq_len_k_start,
+        TensorView cu_seq_len_k_end, bool clean_logits,
+        int64_t max_seqlen_k) {
+    auto result = attention::fp8_mqa_logits_bf16(
+        convert_to_torch_tensor(q),
+        std::make_pair(convert_to_torch_tensor(kv_data),
+                       convert_to_torch_tensor(kv_sf)),
+        convert_to_torch_tensor(weights),
+        convert_to_torch_tensor(cu_seq_len_k_start),
+        convert_to_torch_tensor(cu_seq_len_k_end),
+        clean_logits, static_cast<int>(max_seqlen_k));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+
+Tensor dg_fp8_mqa_backward_logits(
+        TensorView q, TensorView kv_data, TensorView kv_sf,
+        TensorView weights, TensorView window_starts,
+        TensorView cu_seq_len_k_end, TensorView q_block_starts,
+        int64_t backward_len, int64_t output_len) {
+    auto result = attention::fp8_mqa_backward_logits(
+        convert_to_torch_tensor(q),
+        std::make_pair(
+            convert_to_torch_tensor(kv_data),
+            convert_to_torch_tensor(kv_sf)),
+        convert_to_torch_tensor(weights),
+        convert_to_torch_tensor(window_starts),
+        convert_to_torch_tensor(cu_seq_len_k_end),
+        convert_to_torch_tensor(q_block_starts),
+        static_cast<int>(backward_len),
+        static_cast<int>(output_len));
+    return Tensor::FromDLPack(at::toDLPack(result));
+}
+
+void dg_fp8_mqa_backward_topk(
+        TensorView logits, TensorView lengths, TensorView row_starts,
+        TensorView window_starts, TensorView scores, TensorView indices) {
+    auto scores_t = convert_to_torch_tensor(scores);
+    auto indices_t = convert_to_torch_tensor(indices);
+    attention::fp8_mqa_backward_topk(
+        convert_to_torch_tensor(logits),
+        convert_to_torch_tensor(lengths),
+        convert_to_torch_tensor(row_starts),
+        convert_to_torch_tensor(window_starts),
+        scores_t,
+        indices_t);
+}
+
+void dg_fp8_mqa_filter_candidates(
+        TensorView q, TensorView kv_data, TensorView kv_sf,
+        TensorView weights, TensorView cu_seq_len_k_start,
+        TensorView cu_seq_len_k_end, TensorView thresholds,
+        TensorView candidate_scores, TensorView candidate_indices,
+        TensorView candidate_counts, TensorView candidate_overflow,
+        int64_t candidate_capacity) {
+    auto scores = convert_to_torch_tensor(candidate_scores);
+    auto indices = convert_to_torch_tensor(candidate_indices);
+    auto counts = convert_to_torch_tensor(candidate_counts);
+    auto overflow = convert_to_torch_tensor(candidate_overflow);
+    attention::fp8_mqa_filter_candidates(
+        convert_to_torch_tensor(q),
+        std::make_pair(convert_to_torch_tensor(kv_data),
+                       convert_to_torch_tensor(kv_sf)),
+        convert_to_torch_tensor(weights),
+        convert_to_torch_tensor(cu_seq_len_k_start),
+        convert_to_torch_tensor(cu_seq_len_k_end),
+        convert_to_torch_tensor(thresholds),
+        scores, indices, counts, overflow,
+        static_cast<int>(candidate_capacity));
+}
+
+void dg_mqa_final_topk(
+        TensorView prefix_scores, TensorView prefix_indices,
+        TensorView candidate_scores, TensorView candidate_indices,
+        TensorView candidate_counts, TensorView page_table,
+        TensorView cu_seqlens_q, TensorView transform_offsets,
+        bool transform_indices,
+        TensorView output_scores,
+        TensorView output_indices) {
+    auto output_scores_t = convert_to_torch_tensor(output_scores);
+    auto output_indices_t = convert_to_torch_tensor(output_indices);
+    attention::mqa_final_topk(
+        convert_to_torch_tensor(prefix_scores),
+        convert_to_torch_tensor(prefix_indices),
+        convert_to_torch_tensor(candidate_scores),
+        convert_to_torch_tensor(candidate_indices),
+        convert_to_torch_tensor(candidate_counts),
+        convert_to_torch_tensor(page_table),
+        convert_to_torch_tensor(cu_seqlens_q),
+        convert_to_torch_tensor(transform_offsets),
+        transform_indices,
+        output_scores_t,
+        output_indices_t);
+}
+
 Tensor dg_get_paged_mqa_logits_metadata(TensorView context_lens, int64_t block_kv,
                                        int64_t num_sms, Optional<TensorView> indices) {
     auto indices_val = indices.has_value()?
@@ -629,6 +725,15 @@ Tensor dg_fp8_fp4_paged_mqa_logits(TensorView q, Optional<TensorView> q_sf, Tens
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_gemm_nt_skip_head_mid, dg_fp8_gemm_nt_skip_head_mid);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_mqa_logits, dg_fp8_mqa_logits);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    fp8_mqa_logits_bf16, dg_fp8_mqa_logits_bf16);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    fp8_mqa_backward_logits, dg_fp8_mqa_backward_logits);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    fp8_mqa_backward_topk, dg_fp8_mqa_backward_topk);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    fp8_mqa_filter_candidates, dg_fp8_mqa_filter_candidates);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(mqa_final_topk, dg_mqa_final_topk);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_paged_mqa_logits_metadata, dg_get_paged_mqa_logits_metadata);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_paged_mqa_logits, dg_fp8_paged_mqa_logits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mqa_logits, dg_fp8_fp4_mqa_logits);
