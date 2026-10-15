@@ -159,6 +159,8 @@ void smxx_mqa_final_topk(
 
     for (int i = tid; i < TopK; i += kThreadsPerBlock)
         s_indices[i] = -1;
+    if (tid == 0)
+        s_counter = 0;
     if (tid < kRadix + 1)
         hist[tid] = 0;
     __syncthreads();
@@ -183,23 +185,13 @@ void smxx_mqa_final_topk(
     __syncthreads();
 
     run_cumsum();
-    if (tid < kRadix && hist[tid] > TopK && hist[tid + 1] <= TopK) {
-        s_threshold_bin_id = tid;
-        s_num_input[0] = 0;
-        s_counter = 0;
-    }
-    __syncthreads();
-
-    int topk = TopK;
-    int threshold_bin = s_threshold_bin_id;
-    topk -= hist[threshold_bin + 1];
-    if (topk == 0) {
+    // No threshold bin exists when all valid inputs fit in TopK. In
+    // particular, this includes a full prefix with zero history candidates.
+    if (hist[0] <= TopK) {
         for (int i = tid; i < TopK; i += kThreadsPerBlock) {
-            if (prefix_index_row[i] >= 0 &&
-                static_cast<int>(score_to_coarse_bin(prefix_score_row[i])) > threshold_bin) {
+            if (prefix_index_row[i] >= 0) {
                 const int pos = atomicAdd(&s_counter, 1);
-                if (pos < TopK)
-                    s_indices[pos] = i;
+                s_indices[pos] = i;
             }
         }
         for (int producer_group = 0; producer_group < 8; ++producer_group) {
@@ -207,131 +199,168 @@ void smxx_mqa_final_topk(
             const int producer_warp = producer_linear / kWarpSize;
             const int producer_lane = producer_linear - producer_warp * kWarpSize;
             const int count = count_row[producer_warp * kWarpSize + producer_lane];
-            const int candidate_base =
-                producer_warp * candidate_capacity + producer_lane * lane_capacity;
+            const int candidate_base = producer_warp * candidate_capacity + producer_lane * lane_capacity;
             for (int lane_slot = consumer_lane; lane_slot < count; lane_slot += kWarpSize) {
                 const int offset = candidate_base + lane_slot;
-                const int id = TopK + offset;
-                if (candidate_index_row[offset] >= 0 &&
-                    static_cast<int>(score_to_coarse_bin(candidate_score_row[offset])) > threshold_bin) {
+                if (candidate_index_row[offset] >= 0) {
                     const int pos = atomicAdd(&s_counter, 1);
-                    if (pos < TopK)
-                        s_indices[pos] = id;
+                    s_indices[pos] = TopK + offset;
                 }
             }
         }
         __syncthreads();
     } else {
-        __syncthreads();
-        if (tid < kRadix + 1)
-            hist[tid] = 0;
+        if (tid < kRadix && hist[tid] > TopK && hist[tid + 1] <= TopK) {
+            s_threshold_bin_id = tid;
+            s_num_input[0] = 0;
+            s_counter = 0;
+        }
         __syncthreads();
 
-        for (int i = tid; i < TopK; i += kThreadsPerBlock) {
-            if (prefix_index_row[i] < 0)
-                continue;
-            const int bin = static_cast<int>(score_to_coarse_bin(prefix_score_row[i]));
-            if (bin > threshold_bin) {
-                const int pos = atomicAdd(&s_counter, 1);
-                if (pos < TopK)
-                    s_indices[pos] = i;
-            } else if (bin == threshold_bin) {
-                const int pos = atomicAdd(&s_num_input[0], 1);
-                if (pos < kSmemInputSize) {
-                    s_input_idx[0][pos] = i;
-                    atomicAdd(&hist[(score_to_key(prefix_score_row[i]) >> 24) & 0xff], 1);
-                }
-            }
-        }
-        for (int producer_group = 0; producer_group < 8; ++producer_group) {
-            const int producer_linear = producer_group * 32 + consumer_warp;
-            const int producer_warp = producer_linear / kWarpSize;
-            const int producer_lane = producer_linear - producer_warp * kWarpSize;
-            const int count = count_row[producer_warp * kWarpSize + producer_lane];
-            const int candidate_base =
-                producer_warp * candidate_capacity + producer_lane * lane_capacity;
-            for (int lane_slot = consumer_lane; lane_slot < count; lane_slot += kWarpSize) {
-                const int offset = candidate_base + lane_slot;
-                const int id = TopK + offset;
-                if (candidate_index_row[offset] < 0)
-                    continue;
-                const float score = candidate_score_row[offset];
-                const int bin = static_cast<int>(score_to_coarse_bin(score));
-                if (bin > threshold_bin) {
+        int topk = TopK;
+        int threshold_bin = s_threshold_bin_id;
+        topk -= hist[threshold_bin + 1];
+        if (topk == 0) {
+            for (int i = tid; i < TopK; i += kThreadsPerBlock) {
+                if (prefix_index_row[i] >= 0 &&
+                    static_cast<int>(score_to_coarse_bin(prefix_score_row[i])) > threshold_bin) {
                     const int pos = atomicAdd(&s_counter, 1);
                     if (pos < TopK)
-                        s_indices[pos] = id;
-                } else if (bin == threshold_bin) {
-                    const int pos = atomicAdd(&s_num_input[0], 1);
-                    if (pos < kSmemInputSize) {
-                        s_input_idx[0][pos] = id;
-                        atomicAdd(&hist[(score_to_key(score) >> 24) & 0xff], 1);
-                    }
+                        s_indices[pos] = i;
                 }
             }
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (int round = 0; round < 4; ++round) {
-            const int r_idx = round & 1;
-            const int raw_num_input = s_num_input[r_idx];
-            const int num_input = raw_num_input < kSmemInputSize ? raw_num_input : kSmemInputSize;
-
-            run_cumsum();
-            if (tid < kRadix && hist[tid] > topk && hist[tid + 1] <= topk) {
-                s_threshold_bin_id = tid;
-                s_num_input[r_idx ^ 1] = 0;
-                s_last_remain = topk - hist[tid + 1];
-            }
-            __syncthreads();
-
-            threshold_bin = s_threshold_bin_id;
-            topk -= hist[threshold_bin + 1];
-            const int shift = 24 - round * 8;
-
-            if (topk == 0) {
-                for (int i = tid; i < num_input; i += kThreadsPerBlock) {
-                    const int id = s_input_idx[r_idx][i];
-                    const int bin = (score_to_key(load_score_by_id(id)) >> shift) & 0xff;
-                    if (bin > threshold_bin) {
+            for (int producer_group = 0; producer_group < 8; ++producer_group) {
+                const int producer_linear = producer_group * 32 + consumer_warp;
+                const int producer_warp = producer_linear / kWarpSize;
+                const int producer_lane = producer_linear - producer_warp * kWarpSize;
+                const int count = count_row[producer_warp * kWarpSize + producer_lane];
+                const int candidate_base =
+                    producer_warp * candidate_capacity + producer_lane * lane_capacity;
+                for (int lane_slot = consumer_lane; lane_slot < count; lane_slot += kWarpSize) {
+                    const int offset = candidate_base + lane_slot;
+                    const int id = TopK + offset;
+                    if (candidate_index_row[offset] >= 0 &&
+                        static_cast<int>(score_to_coarse_bin(candidate_score_row[offset])) > threshold_bin) {
                         const int pos = atomicAdd(&s_counter, 1);
                         if (pos < TopK)
                             s_indices[pos] = id;
                     }
                 }
-                __syncthreads();
-                break;
             }
-
+            __syncthreads();
+        } else {
             __syncthreads();
             if (tid < kRadix + 1)
                 hist[tid] = 0;
             __syncthreads();
-            for (int i = tid; i < num_input; i += kThreadsPerBlock) {
-                const int id = s_input_idx[r_idx][i];
-                const uint32_t key = score_to_key(load_score_by_id(id));
-                const int bin = (key >> shift) & 0xff;
+
+            for (int i = tid; i < TopK; i += kThreadsPerBlock) {
+                if (prefix_index_row[i] < 0)
+                    continue;
+                const int bin = static_cast<int>(score_to_coarse_bin(prefix_score_row[i]));
                 if (bin > threshold_bin) {
                     const int pos = atomicAdd(&s_counter, 1);
                     if (pos < TopK)
-                        s_indices[pos] = id;
+                        s_indices[pos] = i;
                 } else if (bin == threshold_bin) {
-                    if (round == 3) {
-                        const int pos = atomicAdd(&s_last_remain, -1);
-                        if (pos > 0 && pos <= TopK)
-                            s_indices[TopK - pos] = id;
-                    } else {
-                        const int pos = atomicAdd(&s_num_input[r_idx ^ 1], 1);
+                    const int pos = atomicAdd(&s_num_input[0], 1);
+                    if (pos < kSmemInputSize) {
+                        s_input_idx[0][pos] = i;
+                        atomicAdd(&hist[(score_to_key(prefix_score_row[i]) >> 24) & 0xff], 1);
+                    }
+                }
+            }
+            for (int producer_group = 0; producer_group < 8; ++producer_group) {
+                const int producer_linear = producer_group * 32 + consumer_warp;
+                const int producer_warp = producer_linear / kWarpSize;
+                const int producer_lane = producer_linear - producer_warp * kWarpSize;
+                const int count = count_row[producer_warp * kWarpSize + producer_lane];
+                const int candidate_base =
+                    producer_warp * candidate_capacity + producer_lane * lane_capacity;
+                for (int lane_slot = consumer_lane; lane_slot < count; lane_slot += kWarpSize) {
+                    const int offset = candidate_base + lane_slot;
+                    const int id = TopK + offset;
+                    if (candidate_index_row[offset] < 0)
+                        continue;
+                    const float score = candidate_score_row[offset];
+                    const int bin = static_cast<int>(score_to_coarse_bin(score));
+                    if (bin > threshold_bin) {
+                        const int pos = atomicAdd(&s_counter, 1);
+                        if (pos < TopK)
+                            s_indices[pos] = id;
+                    } else if (bin == threshold_bin) {
+                        const int pos = atomicAdd(&s_num_input[0], 1);
                         if (pos < kSmemInputSize) {
-                            s_input_idx[r_idx ^ 1][pos] = id;
-                            atomicAdd(&hist[(key >> (shift - 8)) & 0xff], 1);
+                            s_input_idx[0][pos] = id;
+                            atomicAdd(&hist[(score_to_key(score) >> 24) & 0xff], 1);
                         }
                     }
                 }
             }
             __syncthreads();
+
+    #pragma unroll
+            for (int round = 0; round < 4; ++round) {
+                const int r_idx = round & 1;
+                const int raw_num_input = s_num_input[r_idx];
+                const int num_input = raw_num_input < kSmemInputSize ? raw_num_input : kSmemInputSize;
+
+                run_cumsum();
+                if (tid < kRadix && hist[tid] > topk && hist[tid + 1] <= topk) {
+                    s_threshold_bin_id = tid;
+                    s_num_input[r_idx ^ 1] = 0;
+                    s_last_remain = topk - hist[tid + 1];
+                }
+                __syncthreads();
+
+                threshold_bin = s_threshold_bin_id;
+                topk -= hist[threshold_bin + 1];
+                const int shift = 24 - round * 8;
+
+                if (topk == 0) {
+                    for (int i = tid; i < num_input; i += kThreadsPerBlock) {
+                        const int id = s_input_idx[r_idx][i];
+                        const int bin = (score_to_key(load_score_by_id(id)) >> shift) & 0xff;
+                        if (bin > threshold_bin) {
+                            const int pos = atomicAdd(&s_counter, 1);
+                            if (pos < TopK)
+                                s_indices[pos] = id;
+                        }
+                    }
+                    __syncthreads();
+                    break;
+                }
+
+                __syncthreads();
+                if (tid < kRadix + 1)
+                    hist[tid] = 0;
+                __syncthreads();
+                for (int i = tid; i < num_input; i += kThreadsPerBlock) {
+                    const int id = s_input_idx[r_idx][i];
+                    const uint32_t key = score_to_key(load_score_by_id(id));
+                    const int bin = (key >> shift) & 0xff;
+                    if (bin > threshold_bin) {
+                        const int pos = atomicAdd(&s_counter, 1);
+                        if (pos < TopK)
+                            s_indices[pos] = id;
+                    } else if (bin == threshold_bin) {
+                        if (round == 3) {
+                            const int pos = atomicAdd(&s_last_remain, -1);
+                            if (pos > 0 && pos <= TopK)
+                                s_indices[TopK - pos] = id;
+                        } else {
+                            const int pos = atomicAdd(&s_num_input[r_idx ^ 1], 1);
+                            if (pos < kSmemInputSize) {
+                                s_input_idx[r_idx ^ 1][pos] = id;
+                                atomicAdd(&hist[(key >> (shift - 8)) & 0xff], 1);
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+            }
         }
+
     }
 
     for (int i = tid; i < TopK; i += kThreadsPerBlock) {
@@ -449,6 +478,9 @@ static void smxx_mqa_final_topk(
     DG_HOST_ASSERT(page_table.is_contiguous() and cu_seqlens_q.is_contiguous());
     DG_HOST_ASSERT(transform_offsets.is_contiguous());
     DG_HOST_ASSERT(output_scores.is_contiguous() and output_indices.is_contiguous());
+
+    if (prefix_scores.size(0) == 0)
+        return;
 
     constexpr int threads = 1024;
     const SMXXMQAFinalTopKRuntime::Args args = {

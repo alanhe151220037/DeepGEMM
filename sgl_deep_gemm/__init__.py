@@ -452,6 +452,15 @@ def fp8_mqa_logits_bf16(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k
 def build_mqa_backward_metadata(
     ks, ke, request_q_lengths, backward_len=65536, block_q=4
 ):
+    """Build request-aware Q blocks for v0.1.5 per-row compressed logits.
+
+    Each row starts at its own window_start, including CP-strided Q positions.
+    The returned row_starts remain part of the TopK API and are always zero.
+    """
+    if backward_len <= 0 or block_q != 4:
+        raise ValueError("backward_len must be positive and block_q must be 4")
+    if ks.numel() != ke.numel() or any(n < 0 for n in request_q_lengths):
+        raise ValueError("ks/ke sizes must match and request lengths must be nonnegative")
     if sum(request_q_lengths) != ks.numel():
         raise ValueError("sum(request_q_lengths) must equal ks.numel()")
     window_starts = torch.maximum(ks, ke - backward_len).contiguous()
@@ -463,31 +472,12 @@ def build_mqa_backward_metadata(
         )
         request_start += request_len
     q_block_starts = torch.full_like(ks, -1)
-    row_block_bases = []
     if block_starts:
         q_block_starts[:len(block_starts)] = torch.tensor(
             block_starts, dtype=torch.int32, device=ks.device
         )
-    request_start = 0
-    for request_len in request_q_lengths:
-        for block_start in range(
-            request_start, request_start + request_len, block_q
-        ):
-            block_end = min(
-                block_start + block_q, request_start + request_len
-            )
-            row_block_bases.extend([block_start] * (block_end - block_start))
-        request_start += request_len
-    block_base_indices = torch.tensor(
-        row_block_bases, dtype=torch.int64, device=ks.device
-    )
-    topk_row_starts = (
-        window_starts - window_starts[block_base_indices]
-    ).to(torch.int32).contiguous()
-    max_block_delta = (
-        int(topk_row_starts.max().item()) if topk_row_starts.numel() != 0 else 0
-    )
-    logits_width = ((backward_len + max_block_delta + 255) // 256) * 256
+    topk_row_starts = torch.zeros_like(ks, dtype=torch.int32)
+    logits_width = ((backward_len + 255) // 256) * 256
     return window_starts, q_block_starts, topk_row_starts, logits_width
 
 def fp8_mqa_backward_logits(
@@ -496,7 +486,7 @@ def fp8_mqa_backward_logits(
 ):
     (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
     if output_len is None:
-        output_len = ((backward_len + 3 + 255) // 256) * 256
+        output_len = ((backward_len + 255) // 256) * 256
     return _C.fp8_mqa_backward_logits(
         q, kv_data, kv_sf, weights, window_starts, ke,
         q_block_starts, backward_len, output_len

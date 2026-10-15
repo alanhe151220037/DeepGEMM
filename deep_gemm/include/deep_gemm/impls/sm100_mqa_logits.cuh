@@ -9,6 +9,7 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/layout/mqa_logits.cuh>
+#include <deep_gemm/impls/mqa_candidate_output.cuh>
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/ptx/ld_st.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
@@ -57,7 +58,8 @@ template <bool kIsFP4, uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128,
+          bool kEnableFilter = false>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
@@ -65,7 +67,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                const cute::TmaDescriptor& tensor_map_kv,
                                                const cute::TmaDescriptor& tensor_map_sf_kv,
                                                const cute::TmaDescriptor& tensor_map_weights,
-                                               const MakeScheduler& make_scheduler) {
+                                               const MakeScheduler& make_scheduler,
+                                               const MQACandidateOutput& candidate_output = {}) {
+    DG_STATIC_ASSERT(not kEnableFilter or (not kIsFP4 and kNumHeads == 32 and
+                     kNumMathThreads == 256 and cute::is_same_v<reduce_dtype_t, float>),
+                     "Candidate filtering requires FP8, FP32 weights and eight math warps");
     const auto sm_idx = blockIdx.x;
     const auto warp_idx = cutlass::canonical_warp_idx_sync();
     const auto warpgroup_idx = warp_idx / 4;
@@ -362,6 +368,7 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
         constexpr uint32_t kNumWeightsRegPerToken = kIsReduceBF16 ? (kNumHeads / 2) : kNumHeads;
         weights_reg_dtype_t weights[BLOCK_Q][kNumWeightsRegPerToken];
         float accum[kNumHeads];
+        MQACandidateWriter<BLOCK_Q, kEnableFilter> candidate_writer(candidate_output, warp_idx, lane_idx);
 
         auto tmem_load_no_fence = [](auto num_elems_t, const uint32_t& addr, float* load_dst) {
             constexpr uint32_t N = decltype(num_elems_t)::value;
@@ -385,6 +392,8 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
 
             const auto process_q_block = [&](auto num_valid_tokens_t) {
                 constexpr uint32_t kNumValidTokens = decltype(num_valid_tokens_t)::value;
+                if constexpr (kEnableFilter)
+                    candidate_writer.template begin<kNumValidTokens>(scheduler, q_block_idx);
 
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumValidTokens; ++ i) {
@@ -486,17 +495,23 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             reduced = (sum.x + sum.y) / 2;
                         }
                         auto result = static_cast<logits_dtype_t>(kIsFP4 ? reduced : reduced * scale_kv);
-                        const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
-                        if constexpr (kIsCompressedLogits) {
-                            const uint32_t rel_kv = kv_offset - seq_k_start[i];
-                            const uint32_t len = seq_k_end[i] - seq_k_start[i];
-                            if (rel_kv < len)
-                                logits[q_offset + rel_kv] = result;
+                        if constexpr (kEnableFilter) {
+                            candidate_writer.store(i, kv_offset, seq_k_start[i], seq_k_end[i], result);
                         } else {
-                            logits[q_offset + kv_offset] = result;
+                            const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
+                            if constexpr (kIsCompressedLogits) {
+                                const uint32_t rel_kv = kv_offset - seq_k_start[i];
+                                const uint32_t len = seq_k_end[i] - seq_k_start[i];
+                                if (rel_kv < len)
+                                    logits[q_offset + rel_kv] = result;
+                            } else {
+                                logits[q_offset + kv_offset] = result;
+                            }
                         }
                     }
                 }
+                if constexpr (kEnableFilter)
+                    candidate_writer.template finish<kNumValidTokens>(scheduler, q_block_idx);
             };
 
             if constexpr (decltype(scheduler)::kHasPartialBlock)

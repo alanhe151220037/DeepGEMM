@@ -298,9 +298,13 @@ static void smxx_mqa_backward_topk(
     DG_HOST_ASSERT(window_starts.numel() == logits.size(0));
     DG_HOST_ASSERT(scores.size(0) == logits.size(0) and scores.size(1) == 2048);
     DG_HOST_ASSERT(indices.size(0) == logits.size(0) and indices.size(1) == 2048);
-    DG_HOST_ASSERT(logits.is_contiguous() and lengths.is_contiguous());
+    DG_HOST_ASSERT(logits.stride(1) == 1 and logits.stride(0) >= logits.size(1));
+    DG_HOST_ASSERT(lengths.is_contiguous());
     DG_HOST_ASSERT(row_starts.is_contiguous() and window_starts.is_contiguous());
     DG_HOST_ASSERT(scores.is_contiguous() and indices.is_contiguous());
+
+    if (logits.size(0) == 0)
+        return;
 
     constexpr int threads = 1024;
     constexpr int dynamic_smem = 2048 * sizeof(int32_t) + 8 * 1024 * sizeof(uint32_t);
