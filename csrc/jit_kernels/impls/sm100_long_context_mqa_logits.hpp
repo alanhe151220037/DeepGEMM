@@ -34,6 +34,7 @@ public:
         int* candidate_overflow;
         int candidate_capacity;
         int* q_block_starts;
+        const bool* q_mask;
 
         CUtensorMap tensor_map_q;
         CUtensorMap tensor_map_kv;
@@ -65,7 +66,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}
+        {}, {}
     >);
 }};
 )",
@@ -75,7 +76,7 @@ static void __instantiate_kernel() {{
     args.num_q_stages, args.num_kv_stages,
     args.launch_args.grid_dim.first,
     args.num_specialized_threads, args.num_math_threads,
-    to_string(args.logits_dtype));
+    to_string(args.logits_dtype), args.q_mask != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -87,7 +88,7 @@ static void __instantiate_kernel() {{
             args.filter_thresholds, args.candidate_scores,
             args.candidate_indices, args.candidate_counts,
             args.candidate_overflow, args.candidate_capacity,
-            args.q_block_starts,
+            args.q_block_starts, args.q_mask,
             args.tensor_map_q, args.tensor_map_kv,
             args.tensor_map_kv_scales, args.tensor_map_weights
         ));
@@ -105,7 +106,8 @@ static void sm100_long_context_mqa_logits(const torch::Tensor& q,
                                 const int& max_seqlen_k, const int& stride_logits,
                                 const int& num_heads, const int& head_dim,
                                 const int& block_q, const int& block_kv,
-                                const torch::Tensor* q_block_starts = nullptr) {
+                                const torch::Tensor* q_block_starts = nullptr,
+                                const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_q_stages = 3, num_kv_stages = 5;
     constexpr int num_math_threads = 256;
@@ -157,6 +159,7 @@ static void sm100_long_context_mqa_logits(const torch::Tensor& q,
         .candidate_capacity = 0,
         .q_block_starts =
             q_block_starts == nullptr ? nullptr : q_block_starts->data_ptr<int>(),
+        .q_mask = q_mask.has_value() ? q_mask->data_ptr<bool>() : nullptr,
         .tensor_map_q = tensor_map_q,
         .tensor_map_kv = tensor_map_kv,
         .tensor_map_kv_scales = tensor_map_kv_scales,
@@ -185,14 +188,14 @@ static void sm100_fp8_mqa_filter_candidates(
         torch::Tensor& candidate_indices,
         torch::Tensor& candidate_counts,
         torch::Tensor& candidate_overflow,
-        const int& candidate_capacity) {
+        const int& candidate_capacity,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     constexpr int num_specialized_threads = 128;
     constexpr int num_math_threads = 256;
     constexpr int num_q_stages = 3;
     constexpr int num_kv_stages = 5;
     constexpr int block_q = 4;
     constexpr int block_kv = 256;
-    constexpr int num_producer_warps = num_math_threads / 32;
 
     const auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
     const auto [seq_len_kv, kv_head_dim] = get_shape<2>(kv);
@@ -208,11 +211,6 @@ static void sm100_fp8_mqa_filter_candidates(
         candidate_overflow.zero_();
         return;
     }
-    DG_HOST_ASSERT(
-        static_cast<uint64_t>(seq_len) * num_producer_warps *
-            candidate_capacity <=
-        0xffffffffull);
-
     const auto tensor_map_q = make_tma_2d_desc(
         q, head_dim, seq_len * num_heads,
         head_dim, block_q * num_heads, head_dim, head_dim);
@@ -253,6 +251,7 @@ static void sm100_fp8_mqa_filter_candidates(
         .candidate_overflow = candidate_overflow.data_ptr<int>(),
         .candidate_capacity = candidate_capacity,
         .q_block_starts = nullptr,
+        .q_mask = q_mask.has_value() ? q_mask->data_ptr<bool>() : nullptr,
         .tensor_map_q = tensor_map_q,
         .tensor_map_kv = tensor_map_kv,
         .tensor_map_kv_scales = tensor_map_kv_scales,

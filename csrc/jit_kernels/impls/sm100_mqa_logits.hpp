@@ -101,6 +101,7 @@ public:
         int* cu_seq_len_k_start;
         int* cu_seq_len_k_end;
         void* logits;
+        const bool* q_mask;
 
         CUtensorMap tensor_map_q;
         CUtensorMap tensor_map_sf_q;
@@ -133,7 +134,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {}, {},
-        {}, {}
+        {}, {}, {}, {}
     >);
 }};
 )", args.is_fp4 ? "true" : "false",
@@ -144,7 +145,8 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first,
     args.num_specialized_threads, args.num_math_threads,
     to_string(args.logits_dtype),
-    args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float");
+    args.weights_dtype == torch::kBFloat16 ? "__nv_bfloat16" : "float",
+    args.num_math_threads / 128, args.q_mask != nullptr);
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -152,7 +154,7 @@ static void __instantiate_kernel() {{
             args.num_q_tokens, args.num_kv_tokens,
             args.stride_logits,
             args.cu_seq_len_k_start, args.cu_seq_len_k_end,
-            args.logits,
+            args.logits, args.q_mask,
             args.tensor_map_q, args.tensor_map_sf_q,
             args.tensor_map_kv, args.tensor_map_sf_kv,
             args.tensor_map_weights
@@ -171,7 +173,8 @@ static void sm100_mqa_logits(const bool& is_fp4,
                              const int& num_q_tokens, const int& num_kv_tokens,
                              const int& max_seqlen_k, const int& stride_logits,
                              const int& num_heads, const int& head_dim,
-                             const int& block_q, const int& split_kv) {
+                             const int& block_q, const int& split_kv,
+                             const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     constexpr int num_specialized_threads = 128;
     const int num_math_threads = 2 * 128;
     const int num_q_stages = 3;
@@ -265,6 +268,7 @@ static void sm100_mqa_logits(const bool& is_fp4,
         .cu_seq_len_k_start = cu_seq_len_k_start.data_ptr<int>(),
         .cu_seq_len_k_end = cu_seq_len_k_end.data_ptr<int>(),
         .logits = logits.data_ptr(),
+        .q_mask = q_mask.has_value() ? q_mask->data_ptr<bool>() : nullptr,
         .tensor_map_q = tensor_map_q,
         .tensor_map_sf_q = tensor_map_sf_q,
         .tensor_map_kv = tensor_map_kv,

@@ -82,6 +82,14 @@ static void fp8_gemm_nt_skip_head_mid(const std::pair<torch::Tensor, torch::Tens
     }
 }
 
+static void check_mqa_q_mask(const std::optional<torch::Tensor>& mask, const torch::Tensor& rows) {
+    if (not mask.has_value())
+        return;
+    DG_HOST_ASSERT(mask->is_cuda() and mask->device() == rows.device());
+    DG_HOST_ASSERT(mask->scalar_type() == torch::kBool and mask->is_contiguous());
+    DG_HOST_ASSERT(mask->dim() == 1 and mask->numel() == rows.size(0));
+}
+
 static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::optional<torch::Tensor>>& q,
                                         const std::tuple<torch::Tensor, torch::Tensor>& kv,
                                         const torch::Tensor& weights,
@@ -89,10 +97,13 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
                                         const torch::Tensor& cu_seq_len_k_end,
                                         const bool& clean_logits,
                                         const int& max_seqlen_k,
-                                        const at::ScalarType& logits_dtype) {
+                                        const at::ScalarType& logits_dtype,
+                                        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     const auto [q_fp, q_sf] = q;
     const auto [kv_fp, kv_sf] = kv;
     const bool is_fp4 = q_sf.has_value();
+    check_mqa_q_mask(q_mask, q_fp);
+    DG_HOST_ASSERT(not q_mask.has_value() or (device_runtime->get_arch_major() == 10 and not is_fp4 and not clean_logits));
     int seq_len, seq_len_kv, num_heads, head_dim;
 
     const auto arch_major = device_runtime->get_arch_major();
@@ -191,7 +202,7 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     // Dispatch implementation
     if (arch_major == 10) {
         sm100_mqa_logits(is_fp4, q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
-                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv, q_mask);
     } else if (arch_major == 12) {
         sm120_mqa_logits(is_fp4, q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                          seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
@@ -437,10 +448,11 @@ static torch::Tensor fp8_mqa_logits(const torch::Tensor& q,
                                     const torch::Tensor& cu_seq_len_k_start,
                                     const torch::Tensor& cu_seq_len_k_end,
                                     const bool& clean_logits,
-                                    const int& max_seqlen_k) {
+                                    const int& max_seqlen_k,
+                                    const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     return fp8_fp4_mqa_logits(std::make_tuple(q, std::nullopt), kv, weights, 
                               cu_seq_len_k_start, cu_seq_len_k_end,
-                              clean_logits, max_seqlen_k, torch::kFloat);
+                              clean_logits, max_seqlen_k, torch::kFloat, q_mask);
 }
 
 static torch::Tensor fp8_mqa_logits_bf16(
@@ -465,7 +477,9 @@ static torch::Tensor fp8_mqa_backward_logits(
         const torch::Tensor& cu_seq_len_k_end,
         const torch::Tensor& q_block_starts,
         const int& backward_len,
-        const int& output_len) {
+        const int& output_len,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
+    check_mqa_q_mask(q_mask, q);
     const auto& [kv_data, kv_scales] = kv;
     const auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
     const auto [seq_len_kv, kv_head_dim] = get_shape<2>(kv_data);
@@ -523,7 +537,7 @@ static torch::Tensor fp8_mqa_backward_logits(
         head_dim,
         block_q,
         block_kv,
-        &q_block_starts);
+        &q_block_starts, q_mask);
     return logits;
 }
 
@@ -533,7 +547,9 @@ static void fp8_mqa_backward_topk(
         const torch::Tensor& row_starts,
         const torch::Tensor& window_starts,
         torch::Tensor& scores,
-        torch::Tensor& indices) {
+        torch::Tensor& indices,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
+    check_mqa_q_mask(q_mask, logits);
     DG_HOST_ASSERT(logits.dim() == 2);
     DG_HOST_ASSERT(lengths.numel() == logits.size(0));
     DG_HOST_ASSERT(row_starts.numel() == logits.size(0));
@@ -544,7 +560,7 @@ static void fp8_mqa_backward_topk(
     DG_HOST_ASSERT(scores.scalar_type() == logits.scalar_type());
     DG_HOST_ASSERT(indices.scalar_type() == torch::kInt32);
     smxx_mqa_backward_topk(
-        logits, lengths, row_starts, window_starts, scores, indices);
+        logits, lengths, row_starts, window_starts, scores, indices, q_mask);
 }
 
 static void fp8_mqa_filter_candidates(
@@ -558,7 +574,9 @@ static void fp8_mqa_filter_candidates(
         torch::Tensor& candidate_indices,
         torch::Tensor& candidate_counts,
         torch::Tensor& candidate_overflow,
-        const int& candidate_capacity) {
+        const int& candidate_capacity,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
+    check_mqa_q_mask(q_mask, q);
     const auto& [kv_data, kv_scales] = kv;
     const auto [seq_len, num_heads, head_dim] = get_shape<3>(q);
     const auto [seq_len_kv, kv_head_dim] = get_shape<2>(kv_data);
@@ -601,7 +619,7 @@ static void fp8_mqa_filter_candidates(
         q, kv_data, kv_scales, weights,
         cu_seq_len_k_start, cu_seq_len_k_end, thresholds,
         candidate_scores, candidate_indices, candidate_counts,
-        candidate_overflow, candidate_capacity);
+        candidate_overflow, candidate_capacity, q_mask);
 }
 
 static void mqa_final_topk(
@@ -615,7 +633,9 @@ static void mqa_final_topk(
         const torch::Tensor& transform_offsets,
         const bool& transform_indices,
         torch::Tensor& output_scores,
-        torch::Tensor& output_indices) {
+        torch::Tensor& output_indices,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
+    check_mqa_q_mask(q_mask, prefix_scores);
     DG_HOST_ASSERT(prefix_scores.dim() == 2);
     DG_HOST_ASSERT(prefix_scores.size(1) == 2048);
     DG_HOST_ASSERT(prefix_indices.sizes() == prefix_scores.sizes());
@@ -639,7 +659,7 @@ static void mqa_final_topk(
     smxx_mqa_final_topk(
         prefix_scores, prefix_indices, candidate_scores, candidate_indices,
         candidate_counts, page_table, cu_seqlens_q, transform_offsets,
-        transform_indices, output_scores, output_indices);
+        transform_indices, output_scores, output_indices, q_mask);
 }
 
 static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
@@ -671,7 +691,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("clean_logits") = true,
           py::arg("max_seqlen_k") = 0,
-          py::arg("logits_dtype") = torch::kFloat32);
+          py::arg("logits_dtype") = torch::kFloat32,
+          py::arg("q_mask") = std::nullopt);
     m.def("get_paged_mqa_logits_metadata", &get_paged_mqa_logits_metadata,
           py::arg("context_lens"), py::arg("block_kv"), py::arg("num_sms"),
           py::arg("indices") = std::nullopt);
@@ -687,7 +708,8 @@ static void register_apis(pybind11::module_& m) {
           py::arg("q"), py::arg("kv"), py::arg("weights"),
           py::arg("cu_seq_len_k_start"), py::arg("cu_seq_len_k_end"),
           py::arg("clean_logits") = true,
-          py::arg("max_seqlen_k") = 0);
+          py::arg("max_seqlen_k") = 0,
+          py::arg("q_mask") = std::nullopt);
     m.def("fp8_paged_mqa_logits", &fp8_paged_mqa_logits,
           py::arg("q"), py::arg("kv_cache"), py::arg("weights"),
           py::arg("context_lens"), py::arg("block_table"), py::arg("schedule_meta"),

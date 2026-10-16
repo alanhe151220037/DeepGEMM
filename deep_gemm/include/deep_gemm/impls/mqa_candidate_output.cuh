@@ -25,7 +25,7 @@ struct MQACandidateWriter<BLOCK_Q, true> {
     uint32_t warp, lane, lane_capacity;
     float thresholds[BLOCK_Q];
     uint32_t counts[BLOCK_Q];
-    // The host bounds the total candidate allocation to UINT32_MAX elements.
+    // Callers keep candidate buffers within 32-bit element offsets.
     uint32_t bases[BLOCK_Q];
 
     CUTLASS_DEVICE MQACandidateWriter(const MQACandidateOutput& output, uint32_t warp, uint32_t lane):
@@ -61,7 +61,7 @@ struct MQACandidateWriter<BLOCK_Q, true> {
         #pragma unroll
         for (uint32_t i = 0; i < kNumTokens; ++i) {
             const auto row = scheduler.get_logits_row(block, i);
-            const auto offset = (static_cast<uint64_t>(row) * 8 + warp) * 32 + lane;
+            const uint32_t offset = (row * 8 + warp) * 32 + lane;
             output.counts[offset] = cute::min(counts[i], lane_capacity);
             output.overflow[offset] = counts[i] > lane_capacity;
         }

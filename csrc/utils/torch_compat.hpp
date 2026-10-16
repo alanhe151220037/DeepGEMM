@@ -113,6 +113,9 @@ inline at::ScalarType dl_dtype_to_torch(DLDataType dtype) {
         case kDLUInt:
             if (dtype.bits == 8) return at::kByte;
             break;
+        case kDLBool:
+            if (dtype.bits == 8) return at::kBool;
+            break;
         case kDLFloat8_e4m3fn: // kDLFloat8_e4m3fn
             return at::kFloat8_e4m3fn;
         default:

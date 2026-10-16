@@ -206,9 +206,9 @@ try:
     def fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits=False, indices=None):
         return _C.fp8_paged_mqa_logits(q, kv_cache, weights, context_lens, block_table, schedule_meta, max_context_len, clean_logits, indices)
 
-    def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0):
+    def fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k=0, q_mask=None):
         (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
-        return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k)
+        return _C.fp8_mqa_logits(q, kv_data, kv_sf, weights, ks, ke, clean_logits, max_seqlen_k, q_mask)
 
 
 
@@ -452,10 +452,12 @@ def fp8_mqa_logits_bf16(q, kv, weights, ks, ke, clean_logits=False, max_seqlen_k
 def build_mqa_backward_metadata(
     ks, ke, request_q_lengths, backward_len=65536, block_q=4
 ):
-    """Build request-aware Q blocks for v0.1.5 per-row compressed logits.
+    """Build request-aware Q blocks with a common output origin per block.
 
-    Each row starts at its own window_start, including CP-strided Q positions.
-    The returned row_starts remain part of the TopK API and are always zero.
+    A block writes [min(window_starts), max(ke)) for each of its real rows.
+    TopK uses row_starts to select each row's own window inside that interval.
+    Pass the returned logits_width as backward_logits's output_len, including
+    for CP-strided Q positions. Computing this width reads one GPU scalar.
     """
     if backward_len <= 0 or block_q != 4:
         raise ValueError("backward_len must be positive and block_q must be 4")
@@ -465,32 +467,81 @@ def build_mqa_backward_metadata(
         raise ValueError("sum(request_q_lengths) must equal ks.numel()")
     window_starts = torch.maximum(ks, ke - backward_len).contiguous()
     block_starts = []
+    row_block_ids = []
     request_start = 0
     for request_len in request_q_lengths:
-        block_starts.extend(
-            range(request_start, request_start + request_len, block_q)
-        )
+        for start in range(request_start, request_start + request_len, block_q):
+            end = min(start + block_q, request_start + request_len)
+            row_block_ids.extend([len(block_starts)] * (end - start))
+            block_starts.append(start)
         request_start += request_len
     q_block_starts = torch.full_like(ks, -1)
+    topk_row_starts = torch.zeros_like(ks, dtype=torch.int32)
     if block_starts:
         q_block_starts[:len(block_starts)] = torch.tensor(
             block_starts, dtype=torch.int32, device=ks.device
         )
-    topk_row_starts = torch.zeros_like(ks, dtype=torch.int32)
-    logits_width = ((backward_len + 255) // 256) * 256
+        block_ids = torch.tensor(row_block_ids, dtype=torch.int64, device=ks.device)
+        # Match the scheduler's minimum, including nonmonotonic row windows.
+        block_origins = torch.full(
+            (len(block_starts),), torch.iinfo(window_starts.dtype).max,
+            dtype=window_starts.dtype, device=ks.device,
+        )
+        block_origins.scatter_reduce_(0, block_ids, window_starts, reduce="amin")
+        topk_row_starts = (window_starts - block_origins[block_ids]).to(torch.int32)
+    max_block_delta = int(topk_row_starts.max().item()) if ks.numel() else 0
+    logits_width = ((backward_len + max_block_delta + 255) // 256) * 256
     return window_starts, q_block_starts, topk_row_starts, logits_width
 
+
 def fp8_mqa_backward_logits(
-    q, kv, weights, window_starts, ke, q_block_starts,
-    backward_len=65536, output_len=None
+    q,
+    kv,
+    weights,
+    window_starts,
+    ke,
+    q_block_starts,
+    backward_len=65536,
+    output_len=None,
+    q_mask=None,
 ):
-    (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
+    """Write Q-block-shared intervals; use the metadata helper's output_len.
+
+    If omitted, infer a safe width from the block bounds (synchronizes CUDA).
+    q_mask=True selects a row; inactive logits remain unwritten.
+    """
+    kv_data, kv_sf = _parse_tensor_or_tuple(kv)
     if output_len is None:
-        output_len = ((backward_len + 255) // 256) * 256
+        width = backward_len
+        if window_starts.numel():
+            starts = q_block_starts.to(torch.int64)
+            next_starts = torch.cat((starts[1:], starts.new_full((1,), -1)))
+            ends = torch.minimum(
+                starts + 4,
+                torch.where(next_starts >= 0, next_starts, window_starts.numel()),
+            )
+            indices = starts[:, None] + torch.arange(4, device=starts.device)
+            valid = (starts[:, None] >= 0) & (indices < ends[:, None])
+            indices = indices.clamp(0, window_starts.numel() - 1)
+            block_starts = torch.where(
+                valid, window_starts[indices], torch.iinfo(window_starts.dtype).max
+            ).amin(1)
+            block_ends = torch.where(valid, ke[indices], 0).amax(1)
+            width = max(width, int((block_ends - block_starts).max().item()))
+        output_len = ((width + 255) // 256) * 256
     return _C.fp8_mqa_backward_logits(
-        q, kv_data, kv_sf, weights, window_starts, ke,
-        q_block_starts, backward_len, output_len
+        q,
+        kv_data,
+        kv_sf,
+        weights,
+        window_starts,
+        ke,
+        q_block_starts,
+        backward_len,
+        output_len,
+        q_mask,
     )
+
 
 def fp8_mqa_backward_topk(
     logits,
@@ -500,27 +551,33 @@ def fp8_mqa_backward_topk(
     backward_len=65536,
     topk=2048,
     index_starts=None,
+    *,
+    lengths=None,
+    q_mask=None,
 ):
+    """Select within windows described by build_mqa_backward_metadata.
+
+    The caller must allocate logits with that helper's logits_width and use
+    its row_starts. No device-value width validation or host sync is performed.
+    Cached int32 lengths can be supplied to avoid rebuilding them per layer.
+    Masked rows return sentinel scores/indices without reading logits.
+    """
     if topk != 2048:
         raise ValueError("fp8_mqa_backward_topk currently supports topk=2048")
     if logits.dim() != 2 or logits.shape[0] != ks.numel():
         raise ValueError("logits must have shape [ks.numel(), logits_width]")
-    lengths = (ke - ks).clamp(min=0, max=backward_len).to(torch.int32)
-    required_width = int(
-        (row_starts.to(torch.int64) + lengths.to(torch.int64)).max().item()
-    ) if lengths.numel() != 0 else 0
-    if logits.shape[1] < required_width:
-        raise ValueError(
-            f"logits.shape[1] must be >= max(row_starts + lengths), "
-            f"got {logits.shape[1]} < {required_width}"
-        )
+    if ke.numel() != ks.numel() or row_starts.numel() != ks.numel():
+        raise ValueError("ks, ke and row_starts must have one element per logits row")
+    if lengths is None:
+        lengths = (ke - ks).clamp(min=0, max=backward_len).to(torch.int32)
+    elif lengths.dim() != 1 or lengths.numel() != ks.numel():
+        raise ValueError("lengths must have one element per logits row")
+    lengths = lengths.to(device=logits.device, dtype=torch.int32).contiguous()
     if index_starts is None:
         index_starts = torch.maximum(ks, ke - backward_len)
     if index_starts.numel() != ks.numel():
         raise ValueError("index_starts must have one element per logits row")
-    index_starts = index_starts.to(
-        device=logits.device, dtype=torch.int32
-    ).contiguous()
+    index_starts = index_starts.to(device=logits.device, dtype=torch.int32).contiguous()
     scores = torch.empty(
         (logits.shape[0], topk), device=logits.device, dtype=logits.dtype
     )
@@ -534,8 +591,10 @@ def fp8_mqa_backward_topk(
         index_starts,
         scores,
         global_indices,
+        q_mask,
     )
     return scores, global_indices
+
 
 def fp8_mqa_filter_candidates(
     q,
@@ -546,8 +605,9 @@ def fp8_mqa_filter_candidates(
     thresholds,
     candidate_capacity_per_warp=8192,
     index_base=None,
+    q_mask=None,
 ):
-    (kv_data, kv_sf) = _parse_tensor_or_tuple(kv)
+    kv_data, kv_sf = _parse_tensor_or_tuple(kv)
     if index_base not in (None, 0):
         raise ValueError(
             "V2 candidate indices are request-local; nonzero index_base "
@@ -561,20 +621,48 @@ def fp8_mqa_filter_candidates(
     counts = torch.zeros((num_queries, 8, 32), device=q.device, dtype=torch.int32)
     overflow = torch.zeros_like(counts)
     _C.fp8_mqa_filter_candidates(
-        q, kv_data, kv_sf, weights, ks, ke, thresholds,
-        scores, indices, counts, overflow, output_capacity)
+        q,
+        kv_data,
+        kv_sf,
+        weights,
+        ks,
+        ke,
+        thresholds,
+        scores,
+        indices,
+        counts,
+        overflow,
+        output_capacity,
+        q_mask,
+    )
     return scores, indices, counts, overflow
 
+
 def mqa_final_topk(
-        prefix_scores, prefix_indices, candidate_scores, candidate_indices,
-        candidate_counts, page_table_size_1, cu_seqlens_q,
-        transform_offsets=None, transform_indices=True):
+    prefix_scores,
+    prefix_indices,
+    candidate_scores,
+    candidate_indices,
+    candidate_counts,
+    page_table_size_1,
+    cu_seqlens_q,
+    transform_offsets=None,
+    transform_indices=True,
+    q_mask=None,
+    out_indices=None,
+):
+    """Select active rows, preserving inactive rows of a supplied out_indices.
+
+    Scores and newly allocated indices are unspecified for inactive rows.
+    """
     if transform_offsets is None:
         transform_offsets = torch.empty(
             0, device=prefix_scores.device, dtype=torch.int32
         )
     output_scores = torch.empty_like(prefix_scores)
-    output_indices = torch.empty_like(prefix_indices)
+    output_indices = (
+        torch.empty_like(prefix_indices) if out_indices is None else out_indices
+    )
     _C.mqa_final_topk(
         prefix_scores,
         prefix_indices,
@@ -587,8 +675,10 @@ def mqa_final_topk(
         transform_indices,
         output_scores,
         output_indices,
+        q_mask,
     )
     return output_scores, output_indices
+
 
 # Some utils
 from . import testing

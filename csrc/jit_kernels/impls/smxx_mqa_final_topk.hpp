@@ -22,10 +22,11 @@ public:
         float* output_scores;
         int32_t* output_indices;
         int32_t candidate_capacity;
-        int64_t page_table_stride;
+        uint32_t page_table_stride;
         int32_t prefill_bs;
         bool transform_indices;
         bool use_transform_offsets;
+        const bool* q_mask;
         LaunchArgs launch_args;
     };
 
@@ -71,24 +72,26 @@ void smxx_mqa_final_topk(
     float* __restrict__ output_scores,
     int32_t* __restrict__ output_indices,
     int candidate_capacity,
-    int64_t page_table_stride,
+    uint32_t page_table_stride,
     int prefill_bs,
     bool transform_indices,
-    bool use_transform_offsets) {
-    const int row = blockIdx.x;
+    bool use_transform_offsets, const bool* __restrict__ q_mask) {
+    const uint32_t row = blockIdx.x;
+    if (q_mask != nullptr and not q_mask[row])
+        return;
     const int tid = threadIdx.x;
     const int lane_capacity = candidate_capacity / kWarpSize;
 
-    const float* prefix_score_row = prefix_scores + static_cast<uint64_t>(row) * TopK;
-    const int32_t* prefix_index_row = prefix_indices + static_cast<uint64_t>(row) * TopK;
+    const float* prefix_score_row = prefix_scores + row * TopK;
+    const int32_t* prefix_index_row = prefix_indices + row * TopK;
     const float* candidate_score_row =
-        candidate_scores + static_cast<uint64_t>(row) * kNumWarps * candidate_capacity;
+        candidate_scores + row * kNumWarps * candidate_capacity;
     const int32_t* candidate_index_row =
-        candidate_indices + static_cast<uint64_t>(row) * kNumWarps * candidate_capacity;
+        candidate_indices + row * kNumWarps * candidate_capacity;
     const int32_t* count_row =
-        candidate_counts + static_cast<uint64_t>(row) * kNumWarps * kWarpSize;
-    float* output_score_row = output_scores + static_cast<uint64_t>(row) * TopK;
-    int32_t* output_index_row = output_indices + static_cast<uint64_t>(row) * TopK;
+        candidate_counts + row * kNumWarps * kWarpSize;
+    float* output_score_row = output_scores + row * TopK;
+    int32_t* output_index_row = output_indices + row * TopK;
 
     alignas(128) __shared__ int s_histogram_buf[2][kRadix + 128];
     alignas(128) __shared__ int s_indices[TopK];
@@ -112,7 +115,7 @@ void smxx_mqa_final_topk(
             if (use_transform_offsets)
                 s_transform_offset = transform_offsets[tid];
             else
-                s_page_entry = page_table + static_cast<int64_t>(tid) * page_table_stride;
+                s_page_entry = page_table + static_cast<uint32_t>(tid) * page_table_stride;
         }
     } else {
         for (int i = tid; i < prefill_bs; i += kThreadsPerBlock) {
@@ -120,7 +123,7 @@ void smxx_mqa_final_topk(
                 if (use_transform_offsets)
                     s_transform_offset = transform_offsets[i];
                 else
-                    s_page_entry = page_table + static_cast<int64_t>(i) * page_table_stride;
+                    s_page_entry = page_table + static_cast<uint32_t>(i) * page_table_stride;
             }
         }
     }
@@ -402,6 +405,7 @@ void smxx_mqa_final_topk(
         auto prefill_bs = args.prefill_bs;
         auto transform_indices = args.transform_indices;
         auto use_transform_offsets = args.use_transform_offsets;
+        auto q_mask = args.q_mask;
         DG_CUDA_UNIFIED_CHECK(launch_kernel(
             kernel, config,
             prefix_scores,
@@ -418,7 +422,7 @@ void smxx_mqa_final_topk(
             page_table_stride,
             prefill_bs,
             transform_indices,
-            use_transform_offsets));
+            use_transform_offsets, q_mask));
     }
 };
 
@@ -433,13 +437,15 @@ static void smxx_mqa_final_topk(
         const torch::Tensor& transform_offsets,
         const bool& transform_indices,
         torch::Tensor& output_scores,
-        torch::Tensor& output_indices) {
+        torch::Tensor& output_indices,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     DG_HOST_ASSERT(prefix_scores.is_cuda() and prefix_indices.is_cuda());
     DG_HOST_ASSERT(candidate_scores.is_cuda() and candidate_indices.is_cuda());
     DG_HOST_ASSERT(candidate_counts.is_cuda() and output_scores.is_cuda());
     DG_HOST_ASSERT(page_table.is_cuda() and cu_seqlens_q.is_cuda());
     DG_HOST_ASSERT(transform_offsets.is_cuda());
     DG_HOST_ASSERT(output_indices.is_cuda());
+    DG_HOST_ASSERT(output_indices.device() == prefix_scores.device());
     DG_HOST_ASSERT(prefix_scores.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(candidate_scores.scalar_type() == torch::kFloat);
     DG_HOST_ASSERT(prefix_indices.scalar_type() == torch::kInt);
@@ -495,10 +501,11 @@ static void smxx_mqa_final_topk(
         .output_scores = output_scores.data_ptr<float>(),
         .output_indices = output_indices.data_ptr<int32_t>(),
         .candidate_capacity = static_cast<int32_t>(candidate_scores.size(2)),
-        .page_table_stride = page_table.stride(0),
+        .page_table_stride = static_cast<uint32_t>(page_table.stride(0)),
         .prefill_bs = static_cast<int32_t>(cu_seqlens_q.size(0) - 1),
         .transform_indices = transform_indices,
         .use_transform_offsets = transform_offsets.numel() != 0,
+        .q_mask = q_mask.has_value() ? q_mask->data_ptr<bool>() : nullptr,
         .launch_args = LaunchArgs(static_cast<int>(prefix_scores.size(0)), threads, 0)
     };
     const auto code = SMXXMQAFinalTopKRuntime::generate(args);

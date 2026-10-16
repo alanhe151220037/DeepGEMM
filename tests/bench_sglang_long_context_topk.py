@@ -4,9 +4,10 @@ Examples (run after building/installing this DeepGEMM and sgl_kernel):
   python tests/bench_sglang_long_context_topk.py --sglang-root ../sglang-taas-approaching --preset smoke --modes all
   python tests/bench_sglang_long_context_topk.py --sglang-root ../sglang-taas-approaching --preset long --json long.json
   python tests/bench_sglang_long_context_topk.py --requests 32768:41,24576:25 --cp-size 8 --backward-len 4096 --modes all
-  python tests/bench_sglang_long_context_topk.py --preset chunked --free-mem-gb 0.125 --modes all
+  python tests/bench_sglang_long_context_topk.py --preset chunked --max-rows 128 --modes all
+  python tests/bench_sglang_long_context_topk.py --preset mixed --modes all
 
-The measured boundary starts with Q/KV/weights and request metadata already
+The exercised path starts with Q/KV/weights and request metadata already
 prepared. It includes the original indexer methods' allocations, metadata,
 chunking, .item() synchronizations, threshold reduction and index transforms.
 KV-cache gathering, projections/quantization, distributed CP communication,
@@ -18,10 +19,13 @@ the serving engine. Their bodies are not rewritten. The pool adapter returns
 the prepared KV, and PP receive is disabled. The real sgl_kernel backend is
 used. Source hashes are recorded to identify the code actually exercised.
 
-Default fixed-memory planning gives both paths the same free-memory budget;
-the original SGLang 0.45/0.4 planning rules still run. --memory-policy live
-uses real mem_get_info instead. Timed runs disable overflow logging. Checks
-run separately and always inspect overflow, irrespective of that log switch.
+The original path retains SGLang's memory planning; --memory-policy and
+--free-mem-gb control only that path. The custom path uses only the optional
+--max-rows cap (128 for the chunked preset, otherwise 0 for all Q rows).
+The first warmup builds its metadata once; measured runs reuse it, matching
+subsequent layers of the same forward.
+Profiled runs disable overflow logging. Checks run separately and always
+inspect overflow, irrespective of that log switch.
 
 --input accepts a torch.save dictionary (weights_only=True): q_fp8, k_fp8,
 k_scale, weights, ks, ke, request_q_lengths, request_k_lengths, and optionally
@@ -35,7 +39,13 @@ model scores. Tied index choices are accepted when selected score multisets
 match. Duplicates, invalid IDs, missing entries, score mismatches or candidate
 overflow fail the run. --check-max-rows limits score checks to a prefix and is
 reported as partial coverage; overflow is still checked for every row.
-CUDA event times include stream launch gaps and are not pure kernel time.
+Performance output contains only actual CUDA kernel execution durations from
+torch.profiler/CUPTI, averaged per launch for each kernel and launch geometry.
+CPU work, launch gaps, memcpy and memset events are excluded. Warmup and
+accuracy checks run outside profiling. These numbers do not measure end-to-end
+latency. Full kernel symbols and launch counts are available with --json;
+numbered variants in the console distinguish different symbols/geometries.
+CUDA profiling support is required; there is no CUDA-event timing fallback.
 """
 
 from __future__ import annotations
@@ -53,10 +63,9 @@ import logging
 import math
 import os
 from pathlib import Path
-import statistics
 import subprocess
 import sys
-import time
+import tempfile
 from types import SimpleNamespace
 
 torch = None  # --help and --dry-run also work without PyTorch/CUDA.
@@ -66,10 +75,12 @@ PRESETS = {
     "ragged": ([(32768, 41), (24576, 25)], 8, 4096),
     "chunked": ([(65536, 129), (49152, 97)], 1, 4096),
     "long": ([(1048576, 65536)], 8, 65536),
+    "mixed": ([(262144, 5), (262145, 7), (8192, 3), (1048576, 9)], 1, 65536),
 }
 INDEXER_METHODS = {
     "_get_topk_ragged",
     "_get_topk_ragged_long_context",
+    "_get_topk_ragged_short_context",
     "_should_chunk_mqa_logits",
     "_get_mqa_logits_budget_bytes",
     "_mqa_logits_free_mem_fraction",
@@ -82,6 +93,8 @@ METADATA_METHODS = {
     "get_page_table_1",
     "get_seqlens_expanded",
     "get_indexer_kvcache_range",
+    "get_mqa_backward_metadata",
+    "get_mqa_routing_metadata",
     "get_indexer_seq_len",
     "get_indexer_seq_len_cpu",
     "get_dsa_extend_len_cpu",
@@ -112,21 +125,6 @@ def local_q_lengths(requests, cp_size, cp_rank):
             "every request must have at least one Q row on the selected CP rank"
         )
     return result
-
-
-def summary(values):
-    ordered = sorted(values)
-
-    def percentile(p):
-        return ordered[max(0, math.ceil(p * len(ordered)) - 1)]
-
-    return {
-        "mean": statistics.mean(ordered),
-        "min": ordered[0],
-        "p50": percentile(0.5),
-        "p95": percentile(0.95),
-        "max": ordered[-1],
-    }
 
 
 def load_module(path, name):
@@ -193,7 +191,8 @@ def source_contract(root, namespace):
         if not path.is_file():
             raise FileNotFoundError(f"SGLang source file missing: {path}")
     config = load_module(paths["config"], "_bench_sglang_long_context_config")
-    namespace.update(iter_request_q_chunks=config.iter_request_q_chunks)
+    namespace.update(build_mqa_backward_metadata=config.build_mqa_backward_metadata)
+    namespace.update(build_mqa_routing_metadata=config.build_mqa_routing_metadata)
     backend_tree = ast.parse(paths["topk_backend"].read_text(encoding="utf-8"))
     classes = [
         n
@@ -269,44 +268,13 @@ class TorchView:
 
 class Recorder:
     def __init__(self):
-        self.enabled = False
-        self.events = []
         self.audit = None
 
     def call(self, name, fn, *args, **kwargs):
-        if self.enabled:
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                enable_timing=True
-            )
-            start.record()
         result = fn(*args, **kwargs)
-        if self.enabled:
-            end.record()
-            first = args[0] if args else kwargs.get("logits")
-            self.events.append(
-                (
-                    name,
-                    start,
-                    end,
-                    int(first.shape[0]) if hasattr(first, "shape") else None,
-                )
-            )
         if self.audit is not None:
             self.audit.observe(name, args, kwargs, result)
         return result
-
-    def report(self):
-        torch.cuda.synchronize()
-        stages = {}
-        for name, start, end, rows in self.events:
-            entry = stages.setdefault(
-                name, {"stream_ms": 0.0, "calls": 0, "rows_per_call": []}
-            )
-            entry["stream_ms"] += start.elapsed_time(end)
-            entry["calls"] += 1
-            if rows is not None:
-                entry["rows_per_call"].append(rows)
-        return stages
 
 
 class DeepGemmView:
@@ -315,19 +283,9 @@ class DeepGemmView:
 
     def __getattr__(self, name):
         fn = getattr(self.module, name)
-        if not self.recorder.enabled and self.recorder.audit is None:
+        if self.recorder.audit is None:
             return fn
         return lambda *a, **k: self.recorder.call(name, fn, *a, **k)
-
-
-class TopKBackendView:
-    def __init__(self, backend, recorder):
-        self.backend, self.recorder = backend, recorder
-
-    def topk_transform(self, **kwargs):
-        return self.recorder.call(
-            "sglang_topk_transform", self.backend.topk_transform, **kwargs
-        )
 
 
 def make_page_table(k_lengths, device):
@@ -445,7 +403,7 @@ def prepare_inputs(args, device):
     return data
 
 
-def make_metadata(cls, namespace, data, mode, recorder):
+def make_metadata(cls, namespace, data, mode):
     device = data["q_fp8"].device
     q_lengths, k_lengths = data["request_q_lengths"], data["request_k_lengths"]
     q_tensor = torch.tensor(q_lengths, dtype=torch.int32, device=device)
@@ -459,9 +417,7 @@ def make_metadata(cls, namespace, data, mode, recorder):
     metadata.topk_transform_method = (
         methods.RAGGED if mode == "ragged" else methods.PAGED
     )
-    metadata.topk_backend = TopKBackendView(
-        namespace["DSATopKBackend"].SGL_KERNEL, recorder
-    )
+    metadata.topk_backend = namespace["DSATopKBackend"].SGL_KERNEL
     metadata.attn_metadata = SimpleNamespace(
         page_table_1=data["page_table_1"],
         real_page_table=(data["page_table_1"][:, ::64] // 64).contiguous(),
@@ -470,6 +426,8 @@ def make_metadata(cls, namespace, data, mode, recorder):
         topk_indices_offset=data["ks"] if mode == "ragged" else None,
         dsa_seqlens_expanded=(data["ke"] - data["ks"]).contiguous(),
         indexer_k_start_end=(data["ks"], data["ke"]),
+        mqa_backward_metadata_cache={},
+        mqa_routing_metadata_cache={},
         indexer_seq_lens=k_tensor,
         indexer_seq_lens_cpu=k_tensor.cpu(),
         dsa_extend_seq_lens_list=q_lengths,
@@ -495,53 +453,113 @@ def build_runner(cls, config, namespace, data, metadata, custom):
     )
 
 
-def benchmark(runners, warmup, iterations):
+def warmup_runners(runners, warmup):
     for _ in range(warmup):
         for run in runners.values():
             result = run()
             del result
     torch.cuda.synchronize()
-    samples = {name: {"wall_ms": [], "stream_ms": []} for name in runners}
-    for iteration in range(iterations):
-        order = list(runners) if iteration % 2 == 0 else list(reversed(runners))
-        for name in order:
-            torch.cuda.synchronize()
-            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
-                enable_timing=True
-            )
-            before = time.perf_counter()
-            start.record()
-            result = runners[name]()
-            end.record()
-            end.synchronize()
-            samples[name]["wall_ms"].append((time.perf_counter() - before) * 1000)
-            samples[name]["stream_ms"].append(start.elapsed_time(end))
-            del result
-    return {
-        name: {kind: summary(values) for kind, values in entry.items()}
-        for name, entry in samples.items()
-    }
 
 
-def profile(run, recorder):
-    recorder.events.clear()
-    recorder.enabled = True
+def kernel_label(name):
+    # Keep the actual function name, omitting the often very long C++ signature.
+    symbol = name.split("<", 1)[0].split("(", 1)[0].split()[-1]
+    if "sm100_long_context_mqa_logits<" in name:
+        flags = name.split("sm100_long_context_mqa_logits<", 1)[1].split(",")[:4]
+        if len(flags) == 4:
+            if flags[3].strip() == "true":
+                symbol += " (filter_candidates)"
+            elif flags[2].strip() == "true":
+                symbol += " (backward_logits)"
+    return symbol
+
+
+def summarize_kernel_trace(trace):
+    """Aggregate GPU kernel activities, never CPU/runtime API event durations."""
+    groups = {}
+    for event in trace.get("traceEvents", []):
+        if event.get("ph") != "X" or "kernel" not in {
+            part.strip().lower() for part in event.get("cat", "").split(",")
+        }:
+            continue
+        name, duration = event.get("name"), event.get("dur")
+        if not isinstance(name, str) or not name:
+            raise RuntimeError("CUDA kernel activity has no name")
+        if (
+            not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+            or duration < 0
+        ):
+            raise RuntimeError(f"Invalid CUDA duration for {name}: {duration!r}")
+        args = event.get("args", {})
+        geometry = {key: args.get(key) for key in ("device", "grid", "block")}
+        key = (name, json.dumps(geometry, sort_keys=True))
+        entry = groups.setdefault(
+            key, {"name": name, **geometry, "launches": 0, "total_us": 0.0}
+        )
+        entry["launches"] += 1
+        entry["total_us"] += duration
+    if not groups:
+        raise RuntimeError(
+            "No CUDA kernel activities in the profiler trace. Check this PyTorch "
+            "build's CUPTI support and profiler warnings; CPU/API timings cannot "
+            "substitute for GPU kernel durations."
+        )
+    result, variants = [], {}
+    for entry in groups.values():
+        label = kernel_label(entry["name"])
+        variants[label] = variants.get(label, 0) + 1
+        result.append(
+            {
+                **{k: v for k, v in entry.items() if k != "total_us"},
+                "label": f"{label} [v{variants[label]}]",
+                "gpu_us_per_launch": entry["total_us"] / entry["launches"],
+            }
+        )
+    return result
+
+
+def profile_kernels(run, iterations):
+    if (
+        torch.profiler.ProfilerActivity.CUDA
+        not in torch.profiler.supported_activities()
+    ):
+        raise RuntimeError("torch.profiler CUDA/CUPTI support is required")
     torch.cuda.synchronize()
-    baseline = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    try:
-        output = run()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as profiler:
+        for _ in range(iterations):
+            output = run()
+            del output
         torch.cuda.synchronize()
-        result = {
-            "stages": recorder.report(),
-            "peak_allocated_mib": torch.cuda.max_memory_allocated() / 2**20,
-            "extra_peak_allocated_mib": (torch.cuda.max_memory_allocated() - baseline)
-            / 2**20,
-        }
-        del output
-        return result
-    finally:
-        recorder.enabled = False
+    with tempfile.TemporaryDirectory(prefix="mqa-kernel-trace-") as directory:
+        path = Path(directory) / "trace.json"
+        profiler.export_chrome_trace(str(path))
+        trace = json.loads(path.read_text(encoding="utf-8"))
+    return summarize_kernel_trace(trace)
+
+
+def print_fields(values, indent=4):
+    """One accuracy/config field per line, including nested path diagnostics."""
+    for name, value in values.items():
+        if isinstance(value, dict):
+            print(f"{' ' * indent}{name}:")
+            print_fields(value, indent + 2)
+        else:
+            print(f"{' ' * indent}{name}: {value}")
+
+
+def print_kernel_profile(name, kernels):
+    print(f"  {name} kernels (mean GPU us/launch):")
+    for kernel in kernels:
+        print(f"    {kernel['label']}: {kernel['gpu_us_per_launch']:.3f}")
 
 
 class Audit:
@@ -563,46 +581,62 @@ class Audit:
             "capacity_per_warp_per_chunk": [],
         }
 
+    def check_window_logits(self, a, out, row_starts, q_mask=None):
+        n = max(0, min(a[0].shape[0], self.limit - self.chunk_start))
+        for start in range(0, n, self.args.check_rows):
+            end = min(n, start + self.args.check_rows)
+            ref = self.dg.fp8_mqa_logits(
+                a[0][start:end],
+                a[1],
+                a[2][start:end],
+                a[3][start:end],
+                a[4][start:end],
+                clean_logits=False,
+                max_seqlen_k=out.shape[1],
+            )
+            valid = (
+                torch.arange(out.shape[1], device=out.device)[None, :]
+                < (a[4][start:end] - a[3][start:end])[:, None]
+            )
+            if q_mask is not None:
+                valid &= q_mask[start:end, None]
+            columns = torch.arange(out.shape[1], device=out.device)[None, :]
+            offsets = columns + row_starts[start:end, None]
+            actual = out[start:end].gather(
+                1, offsets.long().clamp(max=out.shape[1] - 1)
+            )
+            delta = (ref - actual).abs()[valid]
+            self.stats["window_logit_max_abs_error"] = max(
+                self.stats["window_logit_max_abs_error"],
+                float(delta.max()) if delta.numel() else 0,
+            )
+            self.stats["window_logit_bad_values"] += int(
+                (
+                    ~torch.isclose(
+                        ref,
+                        actual,
+                        rtol=self.args.rtol,
+                        atol=self.args.atol,
+                    )
+                    & valid
+                ).sum()
+            )
+
     def observe(self, name, a, kw, out):
         if name == "fp8_mqa_backward_logits":
             self.chunk_start, self.cursor = self.cursor, self.cursor + a[0].shape[0]
-            n = max(0, min(a[0].shape[0], self.limit - self.chunk_start))
-            for start in range(0, n, self.args.check_rows):
-                end = min(n, start + self.args.check_rows)
-                ref = self.dg.fp8_mqa_logits(
-                    a[0][start:end],
-                    a[1],
-                    a[2][start:end],
-                    a[3][start:end],
-                    a[4][start:end],
-                    clean_logits=False,
-                    max_seqlen_k=out.shape[1],
-                )
-                valid = (
-                    torch.arange(out.shape[1], device=out.device)[None, :]
-                    < (a[4][start:end] - a[3][start:end])[:, None]
-                )
-                delta = (ref - out[start:end]).abs()[valid]
-                self.stats["window_logit_max_abs_error"] = max(
-                    self.stats["window_logit_max_abs_error"],
-                    float(delta.max()) if delta.numel() else 0,
-                )
-                self.stats["window_logit_bad_values"] += int(
-                    (
-                        ~torch.isclose(
-                            ref,
-                            out[start:end],
-                            rtol=self.args.rtol,
-                            atol=self.args.atol,
-                        )
-                        & valid
-                    ).sum()
-                )
+            self.pending_window_logits = (a, out)
         elif name == "fp8_mqa_backward_topk":
             logits, ks, ke, row_starts = a[:4]
+            self.check_window_logits(
+                *self.pending_window_logits, row_starts, kw.get("q_mask")
+            )
+            self.pending_window_logits = None
             scores, ids = out
             n = max(0, min(logits.shape[0], self.limit - self.chunk_start))
             lengths = (ke - ks).clamp(0, self.args.backward_len)
+            if kw.get("q_mask") is not None:
+                lengths = lengths.masked_fill(~kw["q_mask"], 0)
             for start in range(0, n, self.args.check_rows):
                 end = min(n, start + self.args.check_rows)
                 length = lengths[start:end]
@@ -853,7 +887,17 @@ def parse_args(argv=None):
     parser.add_argument("--cp-size", type=int)
     parser.add_argument("--cp-rank", type=int, default=0)
     parser.add_argument("--backward-len", type=int)
+    parser.add_argument(
+        "--min-kv-length",
+        type=int,
+        help="request routing threshold; default 256K for mixed, otherwise 0 to exercise custom kernels",
+    )
     parser.add_argument("--candidate-multiplier", type=float, default=3.0)
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        help="custom row cap; 0 uses all Q rows (default: 128 for chunked, otherwise 0)",
+    )
     parser.add_argument(
         "--distribution", choices=("random", "uniform", "ties"), default="random"
     )
@@ -864,7 +908,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--free-mem-gb",
         type=float,
-        help="fixed planning budget in GiB; defaults to live free memory after input setup",
+        help="original-path planning budget in GiB; defaults to live free memory after input setup",
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
@@ -897,12 +941,24 @@ def parse_args(argv=None):
     args.requests = requests if args.requests is None else args.requests
     args.cp_size = cp if args.cp_size is None else args.cp_size
     args.backward_len = backward if args.backward_len is None else args.backward_len
+    args.min_kv_length = (
+        (256 * 1024 if args.preset == "mixed" else 0)
+        if args.min_kv_length is None
+        else args.min_kv_length
+    )
+    args.max_rows = (
+        (128 if args.preset == "chunked" else 0)
+        if args.max_rows is None
+        else args.max_rows
+    )
     if (
         min(args.warmup, args.iters, args.check_rows, args.backward_len) < 1
         or args.check_max_rows < 0
+        or args.max_rows < 0
+        or args.min_kv_length < 0
     ):
         parser.error(
-            "warmup/iters/check-rows/backward-len must be positive; check-max-rows must be nonnegative"
+            "warmup/iters/check-rows/backward-len must be positive; check-max-rows/max-rows must be nonnegative"
         )
     if args.rank_depth < TOPK or any(
         not math.isfinite(x) or x < 0 for x in (args.atol, args.rtol)
@@ -978,6 +1034,10 @@ def main(argv=None):
                     "source_files": hashes,
                     "requests": args.requests,
                     "local_q_lengths": q_lengths,
+                    "routing_threshold": args.min_kv_length,
+                    "long_request_mask": [
+                        k > args.min_kv_length for k, _ in args.requests
+                    ],
                     "full_logits_gib": sum(q_lengths)
                     * sum(k for k, _ in args.requests)
                     * 4
@@ -1021,9 +1081,10 @@ def main(argv=None):
     )
     config = config_module.NSALongContextTopKConfig.from_value(
         {
-            "min_kv_length": 0,
+            "min_kv_length": args.min_kv_length,
             "backward_length": args.backward_len,
             "candidate_buffer_multiplier": args.candidate_multiplier,
+            "max_rows_per_chunk": args.max_rows,
         }
     )
     report = {
@@ -1039,8 +1100,9 @@ def main(argv=None):
         "planning_budget_gib": planning_budget / 2**30,
         "request_q_lengths": data["request_q_lengths"],
         "request_k_lengths": data["request_k_lengths"],
-        "timing_boundary": "prepared Q/KV/weights and request metadata -> transformed TopK indices; eager execution",
-        "overflow_logging_during_timing": False,
+        "execution_boundary": "prepared Q/KV/weights and request metadata -> transformed TopK indices; eager execution",
+        "performance_metric": "mean CUDA kernel execution time per launch in microseconds (CUPTI)",
+        "overflow_logging_during_profiling": False,
         "results": {},
     }
     modes = ("paged", "ragged", "raw") if args.modes == "all" else (args.modes,)
@@ -1050,13 +1112,15 @@ def main(argv=None):
             f"Running {mode}: Q={data['q_fp8'].shape[0]}, K={data['k_fp8'].shape[0]} ...",
             flush=True,
         )
-        metadata = make_metadata(metadata_cls, namespace, data, mode, recorder)
+        metadata = make_metadata(metadata_cls, namespace, data, mode)
         runners = {
             name: build_runner(indexer_cls, config, namespace, data, metadata, custom)
             for name, custom in (("original", False), ("custom", True))
         }
-        timing = benchmark(runners, args.warmup, args.iters)
-        profiles = {name: profile(run, recorder) for name, run in runners.items()}
+        warmup_runners(runners, args.warmup)
+        profiles = {
+            name: profile_kernels(run, args.iters) for name, run in runners.items()
+        }
         outputs = {"original": runners["original"]()}
         audit = Audit(deep_gemm, args, data["q_fp8"].shape[0])
         recorder.audit = audit
@@ -1077,26 +1141,23 @@ def main(argv=None):
             )
         )
         failed |= mode_failed
-        speedup = (
-            timing["original"]["wall_ms"]["p50"] / timing["custom"]["wall_ms"]["p50"]
-        )
         report["results"][mode] = {
             "passed": not mode_failed,
-            "timing": timing,
-            "p50_wall_speedup": speedup,
-            "profiles": profiles,
+            "kernels": profiles,
             "audit": audit.stats,
             "accuracy": accuracy,
         }
         print(
-            f"{mode}: original={timing['original']['wall_ms']['p50']:.3f} ms, custom={timing['custom']['wall_ms']['p50']:.3f} ms, speedup={speedup:.3f}x; {'FAIL' if mode_failed else 'PASS'}",
+            f"\n{mode}: {'FAIL' if mode_failed else 'PASS'}",
             flush=True,
         )
         for name, profile_result in profiles.items():
-            print(
-                f"  {name}: stages={profile_result['stages']}; peak={profile_result['peak_allocated_mib']:.1f} MiB"
-            )
-        print(f"  audit={audit.stats}\n  accuracy={accuracy}")
+            print_kernel_profile(name, profile_result)
+        print("  audit:")
+        print_fields(audit.stats)
+        print("  accuracy:")
+        print_fields(accuracy)
+        print(flush=True)
         del outputs, metadata, runners, audit
         gc.collect()
         torch.cuda.empty_cache()

@@ -9,7 +9,9 @@ v0.1.5 FP8 logits, so both sides use the same head-reduction definition.
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 try:
     import torch
@@ -20,16 +22,15 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_metadata_helper(package):
+def load_metadata_helper(package, function_name="build_mqa_backward_metadata", **extra):
     # Exercise both shipped wrappers without importing the CUDA extension.
     tree = ast.parse((ROOT / package / "__init__.py").read_text(encoding="utf-8"))
     function = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == "build_mqa_backward_metadata"
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
     )
-    namespace = {"torch": torch}
+    namespace = {"torch": torch, **extra}
     exec(
         compile(
             ast.Module(body=[function], type_ignores=[]), str(ROOT / package), "exec"
@@ -41,6 +42,38 @@ def load_metadata_helper(package):
 
 @unittest.skipIf(torch is None, "PyTorch is not installed")
 class MetadataTests(unittest.TestCase):
+    def test_final_wrapper_preserves_supplied_output_and_mask(self):
+        for package in ("deep_gemm", "sgl_deep_gemm"):
+            seen = []
+
+            def final(*args):
+                seen.append(args)
+                output, mask = args[-2:]
+                output[mask] = 17
+
+            wrapper = load_metadata_helper(
+                package, "mqa_final_topk", _C=SimpleNamespace(mqa_final_topk=final)
+            )
+            scores = torch.zeros(3, 2048)
+            indices = torch.zeros(3, 2048, dtype=torch.int32)
+            output = torch.full_like(indices, -123)
+            mask = torch.tensor([True, False, True])
+            _, actual = wrapper(
+                scores,
+                indices,
+                None,
+                None,
+                None,
+                None,
+                None,
+                q_mask=mask,
+                out_indices=output,
+            )
+            self.assertIs(actual, output)
+            self.assertIs(seen[0][-1], mask)
+            self.assertTrue(bool((output[mask] == 17).all()))
+            self.assertTrue(bool((output[~mask] == -123).all()))
+
     def test_cp_stride_and_request_tails(self):
         for package in ("deep_gemm", "sgl_deep_gemm"):
             with self.subTest(package=package):
@@ -53,8 +86,8 @@ class MetadataTests(unittest.TestCase):
                 windows, blocks, rows, width = helper(ks, ke, [0, 5, 0, 3])
                 self.assertEqual(windows.tolist(), (ke - 65536).tolist())
                 self.assertEqual(blocks.tolist(), [0, 4, 5, -1, -1, -1, -1, -1])
-                self.assertEqual(rows.tolist(), [0] * 8)
-                self.assertEqual(width, 65536)
+                self.assertEqual(rows.tolist(), [0, 8, 16, 24, 0, 0, 8, 16])
+                self.assertEqual(width, 65792)
 
     def test_empty_short_and_nonmonotonic_windows(self):
         for package in ("deep_gemm", "sgl_deep_gemm"):
@@ -69,8 +102,44 @@ class MetadataTests(unittest.TestCase):
             windows, blocks, rows, width = helper(ks, ke, [3], backward_len=4096)
             self.assertEqual(windows.tolist(), [4904, 7, 3904])
             self.assertEqual(blocks.tolist(), [0, -1, -1])
-            self.assertEqual(rows.tolist(), [0, 0, 0])
-            self.assertEqual(width, 4096)
+            self.assertEqual(rows.tolist(), [4897, 0, 3897])
+            self.assertEqual(width, 9216)
+
+    def test_default_output_width_includes_block_union(self):
+        # Validate the optional wrapper fallback without a CUDA extension.
+        for package in ("deep_gemm", "sgl_deep_gemm"):
+            wrapper = load_metadata_helper(
+                package,
+                "fp8_mqa_backward_logits",
+                _parse_tensor_or_tuple=lambda value: value,
+                _C=SimpleNamespace(fp8_mqa_backward_logits=lambda *args: args[-2]),
+            )
+            for starts, ends, blocks, window, expected in (
+                (
+                    [100, 108, 116, 124, 90000],
+                    [4196, 4204, 4212, 4220, 94096],
+                    [0, 4, -1, -1, -1],
+                    4096,
+                    4352,
+                ),
+                ([4904, 7, 3904], [9000, 20, 8000], [0, -1, -1], 4096, 9216),
+                ([], [], [], 4097, 4352),
+            ):
+                starts, ends, blocks = [
+                    torch.tensor(x, dtype=torch.int32) for x in (starts, ends, blocks)
+                ]
+                self.assertEqual(
+                    wrapper(
+                        None,
+                        (None, None),
+                        None,
+                        starts,
+                        ends,
+                        blocks,
+                        backward_len=window,
+                    ),
+                    expected,
+                )
 
     def test_invalid_metadata(self):
         helper = load_metadata_helper("deep_gemm")
@@ -84,6 +153,37 @@ class MetadataTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 helper(*args, **kwargs)
+
+    def test_topk_wrapper_uses_cached_lengths_without_host_scalar_reads(self):
+        for package in ("deep_gemm", "sgl_deep_gemm"):
+            calls = []
+            wrapper = load_metadata_helper(
+                package,
+                "fp8_mqa_backward_topk",
+                _C=SimpleNamespace(
+                    fp8_mqa_backward_topk=lambda *args: calls.append(args)
+                ),
+            )
+            ks = torch.tensor([0, 0], dtype=torch.int32)
+            ke = torch.tensor([70000, 70008], dtype=torch.int32)
+            rows = torch.tensor([0, 8], dtype=torch.int32)
+            lengths = torch.full((2,), 65536, dtype=torch.int32)
+            logits = torch.empty(2, 65792)
+            with patch.object(
+                torch.Tensor,
+                "item",
+                side_effect=AssertionError("width validation synchronizes"),
+            ), patch.object(
+                torch.Tensor, "cpu", side_effect=AssertionError("D2H read")
+            ):
+                wrapper(logits, ks, ke, rows, lengths=lengths)
+                wrapper(logits, ks, ke, rows)
+            self.assertIs(calls[0][1], lengths)
+            torch.testing.assert_close(calls[1][1], lengths)
+            with self.assertRaisesRegex(ValueError, "lengths"):
+                wrapper(logits, ks, ke, rows, lengths=lengths[:1])
+            with self.assertRaisesRegex(ValueError, "row_starts"):
+                wrapper(logits, ks, ke, rows[:1])
 
 
 HAS_SM100 = (
@@ -112,6 +212,132 @@ class KernelTests(unittest.TestCase):
         weights = torch.rand(q_count, 64, device="cuda")[:, :32]
         return q, (kv, scales), weights
 
+    def test_masked_logits_and_custom_pipeline_preserve_shared_rows(self):
+        dg = self.dg
+        request_q = [5, 3, 1, 2, 3]
+        q, kv, weights = self.make_inputs(sum(request_q), 40960)
+        starts, ends, flags = [], [], []
+        for request, n in enumerate(request_q):
+            base = 3 + request * 8192
+            starts.extend([base] * n)
+            length = 6000 if request in (1, 3, 4) else 3000
+            ends.extend(base + length + i * 8 for i in range(n))
+            flags.extend([request in (1, 3, 4)] * n)
+        ks = torch.tensor(starts, dtype=torch.int32, device="cuda")
+        ke = torch.tensor(ends, dtype=torch.int32, device="cuda")
+        mask = torch.tensor(flags, dtype=torch.bool, device="cuda")
+        full = dg.fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False)
+        for active, stride in (
+            (mask, 6144),
+            (~mask, 3072),
+            (torch.zeros_like(mask), 1),
+        ):
+            compact = dg.fp8_mqa_logits(
+                q,
+                kv,
+                weights,
+                ks,
+                ke,
+                clean_logits=False,
+                max_seqlen_k=stride,
+                q_mask=active,
+            )
+            for row in range(q.shape[0]):
+                if bool(active[row]):
+                    start, end = starts[row], ends[row]
+                    torch.testing.assert_close(
+                        compact[row, : end - start],
+                        full[row, start:end],
+                        rtol=0,
+                        atol=0,
+                    )
+
+        windows, blocks, offsets, width = dg.build_mqa_backward_metadata(
+            ks, ke, request_q, backward_len=4096
+        )
+        page_table = torch.arange(8192, dtype=torch.int32, device="cuda").repeat(5, 1)
+        cu_q = torch.tensor([0, 5, 8, 9, 11, 14], dtype=torch.int32, device="cuda")
+
+        def run(active, out=None):
+            logits = dg.fp8_mqa_backward_logits(
+                q,
+                kv,
+                weights,
+                windows,
+                ke,
+                blocks,
+                backward_len=4096,
+                output_len=width,
+                q_mask=active,
+            )
+            for row in range(q.shape[0]):
+                if active is None or bool(active[row]):
+                    lo, hi, col = int(windows[row]), ends[row], int(offsets[row])
+                    torch.testing.assert_close(
+                        logits[row, col : col + hi - lo],
+                        full[row, lo:hi],
+                        rtol=0,
+                        atol=0,
+                    )
+            ps, pi = dg.fp8_mqa_backward_topk(
+                logits,
+                ks,
+                ke,
+                offsets,
+                backward_len=4096,
+                index_starts=windows - ks,
+                q_mask=active,
+            )
+            if active is not None:
+                self.assertTrue(bool((pi[~active] == -1).all()))
+                self.assertTrue(bool(torch.isfinite(ps).all()))
+            cs, ci, cc, overflow = dg.fp8_mqa_filter_candidates(
+                q,
+                kv,
+                weights,
+                ks,
+                windows,
+                ps.amin(1),
+                candidate_capacity_per_warp=1024,
+                q_mask=active,
+            )
+            self.assertFalse(bool(overflow.any()))
+            if active is not None:
+                self.assertFalse(bool(cc[~active].any()))
+            return dg.mqa_final_topk(
+                ps,
+                pi,
+                cs,
+                ci,
+                cc,
+                page_table,
+                cu_q,
+                transform_indices=False,
+                q_mask=active,
+                out_indices=out,
+            )[1]
+
+        expected = run(None)
+        partial = mask.clone()
+        partial[5] = False  # Keep the original shared origin for rows 6 and 7.
+        partial_out = torch.full_like(expected, -123)
+        run(partial, partial_out)
+        torch.testing.assert_close(
+            partial_out[partial].sort(1).values, expected[partial].sort(1).values
+        )
+        self.assertTrue(bool((partial_out[~partial] == -123).all()))
+        shared = torch.full_like(expected, -123)
+        self.assertEqual(run(mask, shared).data_ptr(), shared.data_ptr())
+        torch.testing.assert_close(
+            shared[mask].sort(1).values, expected[mask].sort(1).values
+        )
+        self.assertTrue(bool((shared[~mask] == -123).all()))
+        run(~mask, shared)
+        torch.testing.assert_close(shared.sort(1).values, expected.sort(1).values)
+        snapshot = shared.clone()
+        run(torch.zeros_like(mask), shared)
+        torch.testing.assert_close(shared, snapshot)
+
     def test_four_ops_cp_ragged_and_index_transforms(self):
         dg = self.dg
         q, kv, weights = self.make_inputs(8, 16384)
@@ -124,16 +350,50 @@ class KernelTests(unittest.TestCase):
         windows, blocks, rows, width = dg.build_mqa_backward_metadata(
             ks, ke, [5, 3], backward_len=4096
         )
-        self.assertEqual(rows.tolist(), [0] * 8)
-        self.assertEqual(width, 4096)
+        self.assertEqual(rows.tolist(), [0, 8, 16, 24, 0, 0, 8, 16])
+        self.assertEqual(width, 4352)
         full = dg.fp8_mqa_logits(q, kv, weights, ks, ke, clean_logits=False)
         backward = dg.fp8_mqa_backward_logits(
             q, kv, weights, windows, ke, blocks, backward_len=4096, output_len=width
         )
         for row in range(8):
             start, end = int(windows[row]), int(ke[row])
+            offset = int(rows[row])
             torch.testing.assert_close(
-                backward[row, : end - start], full[row, start:end], rtol=0, atol=0
+                backward[row, offset : offset + end - start],
+                full[row, start:end],
+                rtol=0,
+                atol=0,
+            )
+
+        # All rows must write the same union, including columns outside their
+        # own window. Request tails use their own origin, even within a chunk.
+        union_starts = windows - rows
+        union_ends = torch.tensor(
+            [7224] * 4 + [7232] + [15408] * 3, dtype=torch.int32, device="cuda"
+        )
+        union_ref = dg.fp8_mqa_logits(
+            q,
+            kv,
+            weights,
+            union_starts,
+            union_ends,
+            clean_logits=False,
+            max_seqlen_k=width,
+        )
+        for row in range(8):
+            length = int(union_ends[row] - union_starts[row])
+            torch.testing.assert_close(
+                backward[row, :length], union_ref[row, :length], rtol=0, atol=0
+            )
+        auto_width = dg.fp8_mqa_backward_logits(
+            q, kv, weights, windows, ke, blocks, backward_len=4096
+        )
+        self.assertEqual(auto_width.shape, backward.shape)
+        for row in range(8):
+            length = int(union_ends[row] - union_starts[row])
+            torch.testing.assert_close(
+                auto_width[row, :length], backward[row, :length], rtol=0, atol=0
             )
 
         prefix_scores, prefix_ids = dg.fp8_mqa_backward_topk(
@@ -143,6 +403,7 @@ class KernelTests(unittest.TestCase):
             rows,
             backward_len=4096,
             index_starts=windows - ks,
+            lengths=(ke - ks).clamp(0, 4096).to(torch.int32),
         )
         # The selection algorithm is unchanged; score/index association must be exact.
         absolute = prefix_ids.to(torch.int64) + ks[:, None]
@@ -151,7 +412,14 @@ class KernelTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             prefix_scores.min(1).values,
-            backward.topk(2048, dim=1).values[:, -1],
+            torch.stack(
+                [
+                    backward[r, int(rows[r]) : int(rows[r]) + 4096]
+                    .topk(2048)
+                    .values[-1]
+                    for r in range(8)
+                ]
+            ),
             rtol=0,
             atol=0,
         )

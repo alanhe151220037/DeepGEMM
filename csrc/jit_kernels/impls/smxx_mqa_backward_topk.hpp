@@ -17,7 +17,8 @@ public:
         const int32_t* window_starts;
         void* scores;
         int32_t* indices;
-        int64_t stride_logits;
+        uint32_t stride_logits;
+        const bool* q_mask;
         LaunchArgs launch_args;
     };
 
@@ -220,8 +221,15 @@ void smxx_mqa_backward_topk(
     const int32_t* __restrict__ window_starts,
     float* __restrict__ scores,
     int32_t* __restrict__ indices,
-    int64_t stride_logits) {
-    const uint64_t row = static_cast<uint64_t>(blockIdx.x);
+    uint32_t stride_logits, const bool* __restrict__ q_mask) {
+    const uint32_t row = blockIdx.x;
+    if (q_mask != nullptr and not q_mask[row]) {
+        for (int i = threadIdx.x; i < TopK; i += kThreadsPerBlock) {
+            scores[row * TopK + i] = -3.4028234663852886e38f;
+            indices[row * TopK + i] = -1;
+        }
+        return;
+    }
     const int length = lengths[row];
     const int row_start = row_starts[row];
     const int window_start = window_starts[row];
@@ -265,6 +273,7 @@ void smxx_mqa_backward_topk(
         auto scores = args.scores;
         auto indices = args.indices;
         auto stride_logits = args.stride_logits;
+        auto q_mask = args.q_mask;
         DG_CUDA_UNIFIED_CHECK(launch_kernel(
             kernel, config,
             logits,
@@ -273,7 +282,7 @@ void smxx_mqa_backward_topk(
             window_starts,
             scores,
             indices,
-            stride_logits));
+            stride_logits, q_mask));
     }
 };
 
@@ -283,7 +292,8 @@ static void smxx_mqa_backward_topk(
         const torch::Tensor& row_starts,
         const torch::Tensor& window_starts,
         torch::Tensor& scores,
-        torch::Tensor& indices) {
+        torch::Tensor& indices,
+        const std::optional<torch::Tensor>& q_mask = std::nullopt) {
     DG_HOST_ASSERT(logits.is_cuda() and lengths.is_cuda() and row_starts.is_cuda());
     DG_HOST_ASSERT(window_starts.is_cuda() and scores.is_cuda() and indices.is_cuda());
     DG_HOST_ASSERT(logits.scalar_type() == torch::kFloat);
@@ -315,7 +325,8 @@ static void smxx_mqa_backward_topk(
         .window_starts = window_starts.data_ptr<int32_t>(),
         .scores = scores.data_ptr(),
         .indices = indices.data_ptr<int32_t>(),
-        .stride_logits = logits.stride(0),
+        .stride_logits = static_cast<uint32_t>(logits.stride(0)),
+        .q_mask = q_mask.has_value() ? q_mask->data_ptr<bool>() : nullptr,
         .launch_args = LaunchArgs(static_cast<int>(logits.size(0)), threads, dynamic_smem)
     };
     const auto code = SMXXMQABackwardTopKRuntime::generate(args);

@@ -7,7 +7,7 @@
 
 namespace deep_gemm::sched {
 
-template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs>
+template <uint32_t BLOCK_Q, uint32_t SPLIT_KV, uint32_t kNumSMs, bool kHasQMask = false>
 struct SM100MQALogitsScheduler {
     static constexpr bool kIsPaged = false;
     static constexpr bool kHasPartialBlock = false;
@@ -21,6 +21,8 @@ struct SM100MQALogitsScheduler {
     const uint32_t* cu_seq_len_k_end;
     uint32_t* seq_k_start;
     uint32_t* seq_k_end;
+    const bool* q_mask;
+    uint32_t active_rows;
 
     CUTLASS_DEVICE SM100MQALogitsScheduler(const uint32_t& sm_idx,
                                            const uint32_t& num_q_tokens,
@@ -28,7 +30,8 @@ struct SM100MQALogitsScheduler {
                                            const uint32_t* cu_seq_len_k_start,
                                            const uint32_t* cu_seq_len_k_end,
                                            uint32_t* seq_k_start,
-                                           uint32_t* seq_k_end):
+                                           uint32_t* seq_k_end,
+                                           const bool* q_mask = nullptr):
             current_q_block_idx(sm_idx),
             num_q_blocks(math::ceil_div(num_q_tokens, BLOCK_Q)),
             num_q_tokens(num_q_tokens),
@@ -36,34 +39,53 @@ struct SM100MQALogitsScheduler {
             cu_seq_len_k_start(cu_seq_len_k_start),
             cu_seq_len_k_end(cu_seq_len_k_end),
             seq_k_start(seq_k_start),
-            seq_k_end(seq_k_end) {}
+            seq_k_end(seq_k_end), q_mask(q_mask) {}
 
     // Contiguous KV uses absolute token offsets; align the base to 4 for compressed logits
     CUTLASS_DEVICE bool next_q_block(uint32_t& q_block_idx, uint32_t& kv_token_base, uint32_t& num_kv_splits) {
-        if (current_q_block_idx >= num_q_blocks)
-            return false;
+        while (true) {
+            if (current_q_block_idx >= num_q_blocks)
+                return false;
 
-        q_block_idx = current_q_block_idx;
-        current_q_block_idx += kNumSMs;
+            q_block_idx = current_q_block_idx;
+            current_q_block_idx += kNumSMs;
 
-        uint32_t start = cute::numeric_limits<uint32_t>::max();
-        uint32_t end = cute::numeric_limits<uint32_t>::min();
-        #pragma unroll
-        for (uint32_t token_idx = 0; token_idx < BLOCK_Q; ++ token_idx) {
-            const auto row_idx = cute::min(q_block_idx * BLOCK_Q + token_idx, num_q_tokens - 1);
-            seq_k_start[token_idx] = cute::min(cu_seq_len_k_start[row_idx], num_kv_tokens);
-            seq_k_end[token_idx] = cute::min(cu_seq_len_k_end[row_idx], num_kv_tokens);
-            start = cute::min(start, seq_k_start[token_idx]);
-            end = cute::max(end, seq_k_end[token_idx]);
+            uint32_t start = cute::numeric_limits<uint32_t>::max();
+            uint32_t end = cute::numeric_limits<uint32_t>::min();
+            bool any_active = false;
+            active_rows = 0;
+            #pragma unroll
+            for (uint32_t token_idx = 0; token_idx < BLOCK_Q; ++ token_idx) {
+                const auto row_idx = cute::min(q_block_idx * BLOCK_Q + token_idx, num_q_tokens - 1);
+                seq_k_start[token_idx] = cute::min(cu_seq_len_k_start[row_idx], num_kv_tokens);
+                seq_k_end[token_idx] = cute::min(cu_seq_len_k_end[row_idx], num_kv_tokens);
+                if constexpr (kHasQMask) {
+                    if (q_block_idx * BLOCK_Q + token_idx >= num_q_tokens or not q_mask[row_idx])
+                        continue;
+                    active_rows |= 1u << token_idx;
+                }
+                any_active = true;
+                start = cute::min(start, seq_k_start[token_idx]);
+                end = cute::max(end, seq_k_end[token_idx]);
+            }
+
+            if constexpr (kHasQMask) {
+                if (not any_active)
+                    continue;
+            }
+
+            kv_token_base = start / 4 * 4;
+            num_kv_splits = math::ceil_div(end - kv_token_base, SPLIT_KV);
+            return true;
         }
-
-        kv_token_base = start / 4 * 4;
-        num_kv_splits = math::ceil_div(end - kv_token_base, SPLIT_KV);
-        return true;
     }
 
     CUTLASS_DEVICE uint32_t get_q_tma_token_base(const uint32_t& q_block_idx) const {
         return q_block_idx * BLOCK_Q;
+    }
+
+    CUTLASS_DEVICE bool is_row_active(uint32_t /*block*/, uint32_t token) const {
+        return (active_rows >> token) & 1u;
     }
 
     CUTLASS_DEVICE static uint32_t get_kv_tma_offset(const uint32_t& kv_token_base, const uint32_t& kv_split_idx) {

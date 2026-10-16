@@ -59,7 +59,7 @@ template <bool kIsFP4, uint32_t kNumHeads, uint32_t kHeadDim,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename logits_dtype_t, typename reduce_dtype_t, typename MakeScheduler,
           uint32_t kNumMathWarpGroups = kNumMathThreads / 128,
-          bool kEnableFilter = false>
+          bool kEnableFilter = false, bool kBlockSharedOutput = false, bool kHasQMask = false>
 CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                                                logits_dtype_t* logits,
                                                const cute::TmaDescriptor& tensor_map_q,
@@ -457,6 +457,11 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                             smem.empty_tmem_barriers[tmem_stage_idx].arrive();
                         }
 
+                        // Release TMEM above even when the last row is masked.
+                        if constexpr (kHasQMask) {
+                            if (not scheduler.is_row_active(q_block_idx, i))
+                                continue;
+                        }
                         reduce_dtype_t reduced;
                         if constexpr (kIsReduceBF16) {
                             auto sum_0 = __floats2bfloat162_rn(0.0f, 0.0f);
@@ -498,8 +503,16 @@ CUTLASS_DEVICE void sm100_mqa_logits_core_impl(const uint32_t logits_stride,
                         if constexpr (kEnableFilter) {
                             candidate_writer.store(i, kv_offset, seq_k_start[i], seq_k_end[i], result);
                         } else {
-                            const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<uint64_t>(logits_stride);
-                            if constexpr (kIsCompressedLogits) {
+                            using row_offset_t = cute::conditional_t<kBlockSharedOutput, uint32_t, uint64_t>;
+                            const auto q_offset = scheduler.get_logits_row(q_block_idx, i) * static_cast<row_offset_t>(logits_stride);
+                            if constexpr (kBlockSharedOutput) {
+                                // Every real Q row writes the block's union interval.
+                                // TopK applies the individual row's offset and length.
+                                const uint32_t rel_kv = kv_offset - scheduler.block_window_start;
+                                const uint32_t len = scheduler.block_window_end - scheduler.block_window_start;
+                                if (rel_kv < len and rel_kv < logits_stride)
+                                    logits[q_offset + rel_kv] = result;
+                            } else if constexpr (kIsCompressedLogits) {
                                 const uint32_t rel_kv = kv_offset - seq_k_start[i];
                                 const uint32_t len = seq_k_end[i] - seq_k_start[i];
                                 if (rel_kv < len)
@@ -537,27 +550,28 @@ template <bool kIsFP4,
           uint32_t kNumSMs,
           uint32_t kNumSpecializedThreads, uint32_t kNumMathThreads,
           typename logits_dtype_t, typename reduce_dtype_t = float,
-          uint32_t kNumMathWarpGroups = kNumMathThreads / 128>
+          uint32_t kNumMathWarpGroups = kNumMathThreads / 128, bool kHasQMask = false>
 CUTLASS_GLOBAL __launch_bounds__(kNumSpecializedThreads + kNumMathThreads, 1)
 void sm100_mqa_logits(const uint32_t num_q_tokens, const uint32_t num_kv_tokens,
                       const uint32_t logits_stride,
                       const uint32_t* cu_seq_len_k_start,
                       const uint32_t* cu_seq_len_k_end,
                       logits_dtype_t* logits,
+                      const bool* q_mask,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_q,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_kv,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_sf_kv,
                       const __grid_constant__ cute::TmaDescriptor tensor_map_weights) {
     const auto make_scheduler = [&](const uint32_t& sm_idx, uint32_t* seq_k_start, uint32_t* seq_k_end) {
-        return sched::SM100MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs>(
-            sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, seq_k_start, seq_k_end);
+        return sched::SM100MQALogitsScheduler<BLOCK_Q, SPLIT_KV, kNumSMs, kHasQMask>(
+            sm_idx, num_q_tokens, num_kv_tokens, cu_seq_len_k_start, cu_seq_len_k_end, seq_k_start, seq_k_end, q_mask);
     };
 
     sm100_mqa_logits_core_impl<kIsFP4, kNumHeads, kHeadDim, kIsCompressedLogits, BLOCK_Q, SPLIT_KV,
                                kNumQStages, kNumKVStages, kNumSMs,
                                kNumSpecializedThreads, kNumMathThreads, logits_dtype_t,
-                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups>(
+                               reduce_dtype_t, decltype(make_scheduler), kNumMathWarpGroups, false, false, kHasQMask>(
         logits_stride, logits,
         tensor_map_q, tensor_map_sf_q, tensor_map_kv, tensor_map_sf_kv, tensor_map_weights,
         make_scheduler);
